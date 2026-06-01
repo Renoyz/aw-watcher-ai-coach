@@ -52,11 +52,20 @@ def dashboard_html(
     )
 
     breakdown = analysis.activity_breakdown
-    hourly = analysis.hourly_scores
     correction_panel = (
         '<div id="correction-status" class="correction-status"></div>'
         if interactive
         else ""
+    )
+    ai_summary_hint = (
+        "基于今日活动、切换循环与近期纠错生成。"
+        if interactive
+        else "静态页面不调用 LLM；运行 aw-coach serve 后可生成。"
+    )
+    ai_summary_placeholder = (
+        "点击按钮后会生成本次工作总结。"
+        if interactive
+        else "本页为静态只读面板。"
     )
     interactive_script = _interactive_script() if interactive else ""
 
@@ -72,12 +81,13 @@ def dashboard_html(
             "death_loop_count": len(analysis.death_loops),
             "labels_json": safe_json(list(breakdown.keys())),
             "values_json": safe_json([round(v, 2) for v in breakdown.values()]),
-            "hourly_labels_json": safe_json([f"{h:02d}:00" for h, _ in hourly]),
-            "hourly_values_json": safe_json([score for _, score in hourly]),
             "timeline_html": timeline_html,
             "death_loops_html": render_death_loops(analysis.death_loops),
             "suggestions_html": render_suggestions(suggestions),
             "correction_panel": correction_panel,
+            "ai_summary_hint": ai_summary_hint,
+            "ai_summary_disabled": "" if interactive else "disabled",
+            "ai_summary_placeholder": ai_summary_placeholder,
             "interactive_script": interactive_script,
         },
     )
@@ -120,11 +130,61 @@ const validTypes = [
   "design", "entertainment", "admin", "social"
 ];
 const statusBox = document.getElementById("correction-status");
+const summaryButton = document.getElementById("ai-summary-button");
+const summaryStatus = document.getElementById("ai-summary-status");
+const summaryOutput = document.getElementById("ai-summary-output");
 
 function showStatus(message, isError = false) {
   if (!statusBox) return;
   statusBox.textContent = message;
   statusBox.className = isError ? "correction-status error" : "correction-status";
+}
+
+function showSummaryStatus(message, isError = false) {
+  if (!summaryStatus) return;
+  summaryStatus.textContent = message;
+  summaryStatus.className = isError ? "summary-status error" : "summary-status";
+}
+
+function renderSummary(payload) {
+  if (!summaryOutput) return;
+  summaryOutput.replaceChildren();
+  if (payload.summary) {
+    summaryOutput.textContent = payload.summary;
+    return;
+  }
+  if (Array.isArray(payload.suggestions) && payload.suggestions.length > 0) {
+    const list = document.createElement("ul");
+    payload.suggestions.forEach((item) => {
+      const li = document.createElement("li");
+      li.textContent = item;
+      list.appendChild(li);
+    });
+    summaryOutput.appendChild(list);
+    return;
+  }
+  summaryOutput.textContent = "暂无总结。";
+}
+
+if (summaryButton) {
+  summaryButton.addEventListener("click", async () => {
+    summaryButton.disabled = true;
+    showSummaryStatus("生成中...");
+    try {
+      const response = await fetch("/api/summary", {method: "POST"});
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showSummaryStatus(payload.error || "生成失败", true);
+        return;
+      }
+      renderSummary(payload);
+      showSummaryStatus("已生成");
+    } catch (error) {
+      showSummaryStatus(error.message || "生成失败", true);
+    } finally {
+      summaryButton.disabled = false;
+    }
+  });
 }
 
 document.querySelectorAll(".timeline-clickable").forEach((item) => {

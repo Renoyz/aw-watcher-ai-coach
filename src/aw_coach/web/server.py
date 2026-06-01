@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import urlparse
 
+from aw_coach.ai.cost import CostController
+from aw_coach.ai.summary import generate_ai_summary
 from aw_coach.analyzer import PatternAnalyzer
 from aw_coach.collector import DataCollector
 from aw_coach.correction import VALID_ACTIVITY_TYPES
@@ -32,6 +34,7 @@ class InteractiveReportServer:
         self._html = ""
         self._slices = []
         self._rules = []
+        self._analysis = None
         self._timeline_by_id = {}
 
     @property
@@ -53,6 +56,7 @@ class InteractiveReportServer:
             for s in self._slices
         ]
         analysis = PatternAnalyzer(self.config.analysis).analyze(self._slices, self._rules)
+        self._analysis = analysis
         timeline = build_slice_timeline(self._slices, self._rules)
         self._timeline_by_id = {item["id"]: item for item in timeline}
         self._html = dashboard_html(
@@ -83,7 +87,22 @@ class InteractiveReportServer:
                 self.send_error(404)
 
             def do_POST(self) -> None:
-                if urlparse(self.path).path != "/api/corrections":
+                path = urlparse(self.path).path
+                if path == "/api/summary":
+                    try:
+                        response = server.generate_summary()
+                    except ValueError as e:
+                        self._send_json({"error": str(e)}, status=400)
+                        return
+                    except Exception as e:
+                        logger.exception("Summary API failed")
+                        self._send_json({"error": str(e)}, status=500)
+                        return
+
+                    self._send_json(response)
+                    return
+
+                if path != "/api/corrections":
                     self.send_error(404)
                     return
 
@@ -165,6 +184,28 @@ class InteractiveReportServer:
             "app": source_slice.primary_app,
             "original_type": source_rule.activity_type,
             "corrected_type": corrected_type,
+        }
+
+    def generate_summary(self) -> dict:
+        if self._analysis is None:
+            raise ValueError("Analysis is not ready.")
+
+        storage = Storage(self.config.db_path)
+        try:
+            cost_controller = CostController(self.config.cost, storage)
+            corrections = storage.get_corrections_last_30_days()
+            summary = generate_ai_summary(
+                self._analysis,
+                self.config,
+                corrections=corrections,
+                cost_controller=cost_controller,
+            )
+        finally:
+            storage.close()
+
+        return {
+            "ok": True,
+            "summary": summary,
         }
 
     def stop(self) -> None:

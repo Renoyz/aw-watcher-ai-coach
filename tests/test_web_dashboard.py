@@ -10,7 +10,7 @@ from urllib import request
 
 from aw_coach.analyzer import AnalysisResult
 from aw_coach.collector import ActivitySlice, DataCollector
-from aw_coach.config import AnalysisConfig
+from aw_coach.config import AIConfig, AnalysisConfig, CostConfig, OpenAIConfig
 from aw_coach.rules.engine import RuleResult
 from aw_coach.web.dashboard import dashboard_html, generate_html_dashboard
 from aw_coach.web.server import InteractiveReportServer
@@ -83,7 +83,26 @@ def test_interactive_dashboard_contains_correction_script():
     )
 
     assert "/api/corrections" in html
+    assert "/api/summary" in html
+    assert "ai-summary-button" in html
     assert "timeline-clickable" in html
+
+
+def test_static_dashboard_disables_ai_summary_button():
+    cfg = SimpleNamespace(reports_dir=None)
+
+    html = dashboard_html(
+        cfg,
+        date(2026, 5, 30),
+        _analysis(),
+        slices=[_slice()],
+        rules=[_rule()],
+        interactive=False,
+    )
+
+    assert 'id="ai-summary-button"' in html
+    assert "disabled" in html
+    assert "/api/summary" not in html
 
 
 def test_interactive_server_correction_api_records_to_storage(tmp_path):
@@ -121,3 +140,40 @@ def test_interactive_server_correction_api_records_to_storage(tmp_path):
     assert row["app"] == "chrome"
     assert row["original_type"] == "research"
     assert row["corrected_type"] == "programming"
+
+
+def test_interactive_server_summary_api_calls_llm_once(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path,
+        analysis=AnalysisConfig(),
+        ai=AIConfig(
+            backend="openai",
+            openai=OpenAIConfig(api_key="sk-test"),
+        ),
+        cost=CostConfig(monthly_budget_usd=5.0),
+    )
+    slices = [_slice()]
+
+    with patch.object(DataCollector, "__init__", lambda self, **kw: None), \
+         patch.object(DataCollector, "fetch_range", return_value=slices), \
+         patch(
+             "aw_coach.web.server.generate_ai_summary",
+             return_value="今日主要集中在研究任务，切换较少。下一步建议保留上午高专注时段。",
+         ) as generate_summary:
+        server = InteractiveReportServer(cfg, date(2026, 5, 30), port=0)
+        server.start()
+        try:
+            req = request.Request(
+                f"{server.url}api/summary",
+                data=b"{}",
+                method="POST",
+            )
+            with request.urlopen(req, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.stop()
+
+    assert body["ok"] is True
+    assert "今日主要集中" in body["summary"]
+    generate_summary.assert_called_once()

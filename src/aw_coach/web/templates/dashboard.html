@@ -88,6 +88,58 @@ h1 {
   min-height: 280px;
   padding: 14px;
 }
+.summary-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 280px;
+}
+.summary-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+}
+.summary-meta {
+  margin: 8px 0 14px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.summary-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.summary-button {
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  background: var(--primary);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+.summary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.summary-status {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+.summary-status.error { color: var(--danger); }
+.summary-output {
+  flex: 1;
+  min-height: 150px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+.summary-output ul {
+  margin: 0;
+  padding-left: 20px;
+}
 .section { margin-top: 22px; }
 .section h2 {
   margin: 0 0 10px;
@@ -173,7 +225,17 @@ h1 {
 
   <section class="charts">
     <div class="chart-box"><canvas id="pieChart"></canvas></div>
-    <div class="chart-box"><canvas id="lineChart"></canvas></div>
+    <div class="chart-box summary-panel">
+      <div>
+        <p class="summary-title">AI 总结</p>
+        <p class="summary-meta">{{ ai_summary_hint }}</p>
+      </div>
+      <div class="summary-actions">
+        <button id="ai-summary-button" class="summary-button" type="button" {{ ai_summary_disabled }}>生成总结</button>
+        <span id="ai-summary-status" class="summary-status"></span>
+      </div>
+      <div id="ai-summary-output" class="summary-output">{{ ai_summary_placeholder }}</div>
+    </div>
   </section>
 
   <section class="section">
@@ -207,26 +269,6 @@ new Chart(document.getElementById("pieChart"), {
   options: {
     responsive: true,
     plugins: { title: { display: true, text: "时间分布" }, legend: { position: "bottom" } }
-  }
-});
-
-new Chart(document.getElementById("lineChart"), {
-  type: "line",
-  data: {
-    labels: {{ hourly_labels_json }},
-    datasets: [{
-      label: "专注度",
-      data: {{ hourly_values_json }},
-      borderColor: "#2563eb",
-      backgroundColor: "rgba(37,99,235,0.10)",
-      tension: 0.3,
-      fill: true
-    }]
-  },
-  options: {
-    responsive: true,
-    scales: { y: { min: 0, max: 100 } },
-    plugins: { title: { display: true, text: "精力曲线" } }
   }
 });
 </script>
