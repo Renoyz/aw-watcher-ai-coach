@@ -85,6 +85,26 @@ class TestCorrections:
         assert counts[("myapp", "programming")] == 4
         assert counts[("other", "writing")] == 1
 
+    def test_rule_suggestion_stats_include_source_metadata(self, storage):
+        for _ in range(3):
+            storage.add_correction("2026-05-30T09:00", "myapp", "t", "unknown", "programming")
+
+        stats = storage.get_rule_suggestion_stats()
+
+        assert len(stats) == 1
+        assert stats[0]["app"] == "myapp"
+        assert stats[0]["corrected_type"] == "programming"
+        assert stats[0]["correction_count"] == 3
+        assert stats[0]["latest_corrected_at"]
+        assert "unknown" in stats[0]["original_types"]
+
+    def test_rule_suggestion_decision_is_persisted(self, storage):
+        storage.set_rule_suggestion_status("MyApp", "programming", "rejected")
+
+        decisions = storage.get_rule_suggestion_decisions()
+
+        assert decisions[("myapp", "programming")] == "rejected"
+
 
 class TestStorageInit:
     def test_creates_tables(self, tmp_path):

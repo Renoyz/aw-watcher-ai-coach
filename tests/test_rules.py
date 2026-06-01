@@ -43,6 +43,10 @@ class TestAppExactMatch:
         r = engine.classify("idea", "Main.java - myapp", None)
         assert r.activity_type == "programming"
 
+    def test_builtin_rule_coverage_reaches_top_100_apps(self, engine):
+        apps = {app.lower() for rule in engine.rules for app in rule.match_apps}
+        assert len(apps) >= 100
+
 
 class TestBrowserSubRules:
     def test_youtube_entertainment(self, engine):
@@ -76,6 +80,15 @@ class TestBrowserSubRules:
         """cn.yml sub_rules for CSDN should be merged into browser."""
         r = engine.classify("chrome", "Python教程 - CSDN", "https://csdn.net/article")
         assert r.activity_type == "programming"
+
+    def test_copilot_chat_browser_is_programming(self, engine):
+        r = engine.classify(
+            "chrome",
+            "GitHub Copilot Chat",
+            "https://github.com/copilot",
+        )
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.85
 
 
 class TestChineseApps:
@@ -112,6 +125,28 @@ class TestCommunicationApps:
     def test_discord(self, engine):
         r = engine.classify("Discord", "Server - Channel", None)
         assert r.activity_type == "social"
+
+
+class TestAICodingAgentRules:
+    def test_claude_code_app(self, engine):
+        r = engine.classify("Claude Code", "project session", None)
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.90
+
+    def test_codex_terminal_session(self, engine):
+        r = engine.classify("gnome-terminal", "codex --ask", None)
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.90
+
+    def test_aider_app(self, engine):
+        r = engine.classify("aider", "main.py", None)
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.90
+
+    def test_cursor_agent_title(self, engine):
+        r = engine.classify("Cursor", "Agent applying changes - repo", None)
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.90
 
 
 class TestDesignApps:

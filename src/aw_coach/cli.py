@@ -562,6 +562,21 @@ def doctor(run_calibrate: bool) -> None:
         + f"       budget: ${config.cost.monthly_budget_usd:.2f}/month"
     )
 
+    # 6. Correction feedback loop
+    try:
+        from aw_coach.correction import build_pending_rule_suggestions
+        from aw_coach.storage import Storage
+
+        storage = Storage(config.db_path)
+        correction_count = sum(storage.get_correction_counts().values())
+        pending_count = len(build_pending_rule_suggestions(storage, engine))
+        click.echo(
+            click.style("ℹ️  corrections", fg="blue")
+            + f" {correction_count} stored, {pending_count} pending rule suggestions"
+        )
+    except Exception as e:
+        click.echo(click.style("⚠️  corrections", fg="yellow") + f" {e}")
+
     if run_calibrate:
         click.echo()
         _run_calibrate(config)
@@ -589,10 +604,19 @@ def rule_test(app: str, title: str, url: Optional[str]) -> None:
 
 
 @main.command("rule-suggest")
-def rule_suggest() -> None:
+@click.option(
+    "--from-corrections",
+    is_flag=True,
+    help="Generate suggestions from correction history (default)",
+)
+@click.option("--min-count", default=3, show_default=True, help="Minimum corrections needed")
+def rule_suggest(from_corrections: bool, min_count: int) -> None:
     """Generate rule suggestions from correction history."""
-    import yaml
-
+    from aw_coach.correction import (
+        append_user_rule,
+        build_pending_rule_suggestions,
+        resolve_type,
+    )
     from aw_coach.rules.engine import RuleEngine
     from aw_coach.storage import Storage
 
@@ -600,66 +624,105 @@ def rule_suggest() -> None:
     storage = Storage(config.db_path)
     engine = RuleEngine.with_builtin_rules()
 
-    counts = storage.get_correction_counts()
-    if not counts:
-        click.echo("No corrections stored yet. Use `aw-coach correct` to build samples.")
-        return
-
-    suggestions = []
-    for (app, ctype), count in sorted(counts.items(), key=lambda x: -x[1]):
-        if count >= 3 and not engine.has_confident_rule(app):
-            confidence = min(0.70 + count * 0.05, 0.95)
-            suggestions.append((app, ctype, count, confidence))
-
+    suggestions = build_pending_rule_suggestions(storage, engine, min_count=min_count)
     if not suggestions:
-        click.echo("Not enough correction patterns yet (need 3+ for same app+type).")
+        counts = storage.get_correction_counts()
+        if not counts:
+            click.echo("No corrections stored yet. Use `aw-coach correct --review` first.")
+            return
+        click.echo("No pending rule suggestions.")
         click.echo(f"Current corrections: {sum(counts.values())} total.")
         return
 
-    click.echo("Based on your corrections, suggested rules:\n")
-    for i, (app, ctype, count, conf) in enumerate(suggestions, 1):
-        click.echo(f"  [{i}] app=\"{app}\" -> {ctype} (corrected {count}x, confidence {conf:.2f})")
-
-    click.echo()
-    choice = click.prompt("Accept? [a]ll / numbers (e.g. 1,2) / [n]one", default="a")
-
-    if choice.lower() == "n":
-        click.echo("No rules added.")
-        return
-
-    if choice.lower() == "a":
-        accepted = suggestions
-    else:
-        indices = [int(x.strip()) - 1 for x in choice.split(",") if x.strip().isdigit()]
-        accepted = [suggestions[i] for i in indices if 0 <= i < len(suggestions)]
-
-    if not accepted:
-        click.echo("No valid selection.")
-        return
-
     rules_dir = config.data_dir / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
     user_rules_path = rules_dir / "user.yml"
 
-    existing_rules = []
-    if user_rules_path.exists():
-        data = yaml.safe_load(user_rules_path.read_text()) or {}
-        existing_rules = data.get("rules", [])
+    click.echo(f"Pending rule suggestions ({len(suggestions)}):\n")
+    added = 0
+    rejected = 0
 
-    for app, ctype, count, conf in accepted:
-        existing_rules.append({
-            "name": f"user_{app}",
-            "match_apps": [app],
-            "default_type": ctype,
-            "confidence": round(conf, 2),
-        })
+    for i, suggestion in enumerate(suggestions, 1):
+        original_suggestion = suggestion
+        _print_rule_suggestion(i, suggestion)
+        action = click.prompt(
+            "Action [a]ccept / [e]dit / [r]eject / [s]kip / [q]uit",
+            default="s",
+        ).strip().lower()
 
-    user_rules_path.write_text(
-        yaml.dump({"rules": existing_rules}, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+        if action in {"q", "quit"}:
+            break
+        if action in {"s", "skip", ""}:
+            continue
+        if action in {"r", "reject", "n", "no"}:
+            storage.set_rule_suggestion_status(
+                suggestion.app,
+                suggestion.corrected_type,
+                "rejected",
+            )
+            rejected += 1
+            click.echo("  Rejected.")
+            continue
+        if action in {"e", "edit"}:
+            suggestion = _edit_rule_suggestion(suggestion, resolve_type)
+            if suggestion is None:
+                click.echo("  Edit cancelled.")
+                continue
+
+        if action in {"a", "accept", "y", "yes", "e", "edit"}:
+            append_user_rule(user_rules_path, suggestion)
+            storage.set_rule_suggestion_status(
+                original_suggestion.app,
+                original_suggestion.corrected_type,
+                "accepted",
+                rule_name=suggestion.rule_name,
+            )
+            added += 1
+            click.echo(f"  Accepted: {suggestion.rule_name}")
+            continue
+
+        click.echo(f"  Unknown action: {action}")
+
+    click.echo()
+    click.echo(f"✅ Added {added} rule(s), rejected {rejected} suggestion(s).")
+    if added:
+        click.echo(f"Rules saved to {user_rules_path}")
+        click.echo("Rules take effect on next analysis cycle.")
+
+
+def _print_rule_suggestion(index: int, suggestion) -> None:
+    original = ", ".join(suggestion.original_types) if suggestion.original_types else "unknown"
+    click.echo(f"[{index}] app=\"{suggestion.app}\" -> {suggestion.corrected_type}")
+    click.echo(
+        f"    source: {suggestion.correction_count} corrections, "
+        f"latest {suggestion.latest_corrected_at}"
     )
-    click.echo(f"\n✅ {len(accepted)} rule(s) added to {user_rules_path}")
-    click.echo("Rules take effect on next analysis cycle.")
+    click.echo(f"    confidence: {suggestion.confidence:.2f}")
+    click.echo(f"    original types: {original}")
+
+
+def _edit_rule_suggestion(suggestion, resolve_type):
+    from aw_coach.correction import RuleSuggestion
+
+    app = click.prompt("    app", default=suggestion.app).strip()
+    raw_type = click.prompt("    type", default=suggestion.corrected_type).strip()
+    corrected_type = resolve_type(raw_type)
+    if corrected_type is None:
+        click.echo(f"    Invalid type: {raw_type}")
+        return None
+    confidence = click.prompt(
+        "    confidence",
+        default=round(suggestion.confidence, 2),
+        type=float,
+    )
+    confidence = max(0.0, min(1.0, confidence))
+    return RuleSuggestion(
+        app=app,
+        corrected_type=corrected_type,
+        correction_count=suggestion.correction_count,
+        latest_corrected_at=suggestion.latest_corrected_at,
+        confidence=confidence,
+        original_types=suggestion.original_types,
+    )
 
 
 @main.command("notify-test")
@@ -738,11 +801,18 @@ def cost() -> None:
     is_flag=True,
     help="Review low-confidence items interactively",
 )
+@click.option(
+    "--review",
+    "review",
+    is_flag=True,
+    help="Review low-confidence slices with confirm/skip/type prompts",
+)
 @click.argument("activity_type", required=False)
 def correct(
     correct_last: bool,
     time_range: Optional[str],
     interactive: bool,
+    review: bool,
     activity_type: Optional[str],
 ) -> None:
     """Correct AI classification results."""
@@ -751,24 +821,18 @@ def correct(
     config = load_config()
     storage = Storage(config.db_path)
 
-    valid_types = {
-        "programming",
-        "writing",
-        "meeting",
-        "research",
-        "design",
-        "entertainment",
-        "admin",
-        "social",
-    }
+    from aw_coach.correction import VALID_ACTIVITY_TYPES
 
-    if interactive:
-        _correct_interactive(config, storage, valid_types)
+    valid_types = set(VALID_ACTIVITY_TYPES)
+
+    if review or interactive:
+        _correct_review(config, storage, valid_types, include_all=interactive)
         return
 
     if not activity_type:
         click.echo("Usage: aw-coach correct --last <type>")
         click.echo("       aw-coach correct --time 14:00-15:00 <type>")
+        click.echo("       aw-coach correct --review")
         click.echo("       aw-coach correct --interactive")
         click.echo()
         click.echo("Types: " + ", ".join(sorted(valid_types)))
@@ -897,9 +961,15 @@ def _classifications_for_range(start: datetime, end: datetime):
     ]
 
 
-def _correct_interactive(config: Config, storage, valid_types: set) -> None:
-    """Interactive review of low-confidence classifications."""
+def _correct_review(
+    config: Config,
+    storage,
+    valid_types: set,
+    include_all: bool = False,
+) -> None:
+    """Review classifications and store user corrections."""
     from aw_coach.collector import DataCollector
+    from aw_coach.correction import resolve_type
     from aw_coach.rules.engine import RuleEngine
 
     engine = RuleEngine.with_builtin_rules()
@@ -915,48 +985,58 @@ def _correct_interactive(config: Config, storage, valid_types: set) -> None:
         click.echo("No data today to review.")
         return
 
-    uncertain = []
+    review_items = []
     for s in slices:
         r = engine.classify(s.primary_app, s.primary_title, s.web_url)
-        if r.confidence < 0.70 or r.activity_type == "unknown":
-            uncertain.append((s, r))
+        if include_all or r.confidence < 0.70 or r.activity_type == "unknown":
+            review_items.append((s, r))
 
-    if not uncertain:
+    if not review_items:
         click.echo("✅ All today's classifications are confident. Nothing to review.")
         return
 
-    click.echo(f"Found {len(uncertain)} low-confidence items:\n")
+    label = "items" if include_all else "low-confidence item(s)"
+    click.echo(f"Found {len(review_items)} {label}:\n")
     corrected = 0
-    type_shortcuts = {t[0]: t for t in sorted(valid_types)}
 
-    for i, (s, r) in enumerate(uncertain[:20], 1):
+    for i, (s, r) in enumerate(review_items[:30], 1):
         start = s.start.strftime("%H:%M")
         end = s.end.strftime("%H:%M")
         click.echo(
             f"  [{i}] {start}-{end}  app={s.primary_app}  "
             f'title="{s.primary_title[:50]}"'
         )
-        click.echo(f"       current: {r.activity_type} (confidence {r.confidence:.2f})")
-
-        shortcuts = " ".join(f"[{t[0]}]{t[1:]}" for t in sorted(valid_types))
-        response = click.prompt(
-            f"       correct type? ({shortcuts} / [s]kip)",
-            default="s",
+        click.echo(
+            f"       current: {r.activity_type} "
+            f"({r.method}, confidence {r.confidence:.2f})"
         )
+        response = click.prompt(
+            "       looks correct? [Y]es / [n]o / [s]kip / TYPE",
+            default="y",
+        ).strip().lower()
 
-        if response.lower() == "s":
+        if response in {"y", "yes", ""}:
+            continue
+        if response in {"s", "skip"}:
+            continue
+        if response in {"n", "no"}:
+            shortcuts = " ".join(f"[{t[0]}]{t[1:]}" for t in sorted(valid_types))
+            response = click.prompt(f"       correct type? ({shortcuts})").strip().lower()
+
+        chosen = resolve_type(response, valid_types)
+        if chosen is None:
+            click.echo(f"       invalid type '{response}', skipped.")
             continue
 
-        chosen = type_shortcuts.get(response.lower(), response.lower())
-        if chosen in valid_types:
-            storage.add_correction(
-                timestamp=s.start.isoformat(),
-                app=s.primary_app,
-                title=s.primary_title,
-                original_type=r.activity_type,
-                corrected_type=chosen,
-            )
-            corrected += 1
+        storage.add_correction(
+            timestamp=s.start.isoformat(),
+            app=s.primary_app,
+            title=s.primary_title,
+            original_type=r.activity_type,
+            corrected_type=chosen,
+        )
+        corrected += 1
+        click.echo(f"       saved: {r.activity_type} → {chosen}")
 
     click.echo(f"\n✅ Saved {corrected} correction(s).")
     counts = storage.get_correction_counts()

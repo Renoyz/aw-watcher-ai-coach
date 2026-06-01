@@ -68,6 +68,20 @@ class Storage:
                 PRAGMA user_version = 2;
             """)
 
+        if version < 3:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS rule_suggestion_decisions (
+                    id INTEGER PRIMARY KEY,
+                    app TEXT NOT NULL,
+                    corrected_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    rule_name TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(app, corrected_type)
+                );
+                PRAGMA user_version = 3;
+            """)
+
         self._conn.commit()
 
     # === Cost Log ===
@@ -178,6 +192,43 @@ class Storage:
             "FROM corrections GROUP BY app, corrected_type"
         ).fetchall()
         return {(row["app"], row["corrected_type"]): row["cnt"] for row in rows}
+
+    def get_rule_suggestion_stats(self, min_count: int = 3) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT LOWER(app) AS app_key, app, corrected_type, COUNT(*) AS correction_count, "
+            "MAX(created_at) AS latest_corrected_at, "
+            "GROUP_CONCAT(DISTINCT original_type) AS original_types "
+            "FROM corrections GROUP BY LOWER(app), corrected_type HAVING COUNT(*) >= ? "
+            "ORDER BY correction_count DESC, latest_corrected_at DESC",
+            (min_count,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_rule_suggestion_decisions(self) -> Dict[Tuple[str, str], str]:
+        rows = self._conn.execute(
+            "SELECT app, corrected_type, status FROM rule_suggestion_decisions"
+        ).fetchall()
+        return {
+            (row["app"].lower(), row["corrected_type"]): row["status"] for row in rows
+        }
+
+    def set_rule_suggestion_status(
+        self,
+        app: str,
+        corrected_type: str,
+        status: str,
+        rule_name: Optional[str] = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO rule_suggestion_decisions "
+            "(app, corrected_type, status, rule_name, updated_at) "
+            "VALUES (?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(app, corrected_type) DO UPDATE SET "
+            "status=excluded.status, rule_name=excluded.rule_name, "
+            "updated_at=excluded.updated_at",
+            (app.lower(), corrected_type, status, rule_name),
+        )
+        self._conn.commit()
 
     # === Scheduler State ===
 

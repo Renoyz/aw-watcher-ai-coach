@@ -6,11 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
 from click.testing import CliRunner
 
 from aw_coach.cli import main
 from aw_coach.collector import ActivitySlice, DataCollector
 from aw_coach.config import Config, load_config
+from aw_coach.storage import Storage
 
 
 def test_version_flag():
@@ -160,6 +162,109 @@ def test_doctor_calibrate_runs_calibration_flow():
     assert result.exit_code == 0
     assert "aw-server" in result.output
     assert "mystery-app" in result.output
+
+
+def test_correct_review_records_low_confidence_correction(tmp_path):
+    today = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    slices = [
+        ActivitySlice(
+            start=today,
+            end=today + timedelta(minutes=15),
+            duration=900,
+            is_afk=False,
+            primary_app="chrome",
+            primary_title="Some random page",
+            web_url="https://example.com",
+        ),
+        ActivitySlice(
+            start=today + timedelta(minutes=15),
+            end=today + timedelta(minutes=30),
+            duration=900,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py",
+        ),
+    ]
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch.object(DataCollector, "__init__", lambda self, **kw: None), \
+         patch.object(DataCollector, "fetch_range", return_value=slices):
+        runner = CliRunner()
+        result = runner.invoke(main, ["correct", "--review"], input="programming\n")
+
+    assert result.exit_code == 0
+    assert "low-confidence" in result.output
+
+    conn = sqlite3.connect(cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM corrections").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["app"] == "chrome"
+    assert rows[0]["original_type"] == "research"
+    assert rows[0]["corrected_type"] == "programming"
+
+
+def test_rule_suggest_accept_writes_rule_with_source_stats(tmp_path):
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db", data_dir=tmp_path)
+    storage = Storage(cfg.db_path)
+    for _ in range(3):
+        storage.add_correction("2026-05-30T09:00", "myapp", "Main", "unknown", "programming")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg):
+        runner = CliRunner()
+        result = runner.invoke(main, ["rule-suggest"], input="a\n")
+
+    assert result.exit_code == 0
+    assert "Pending rule suggestions" in result.output
+
+    user_rules = tmp_path / "rules" / "user.yml"
+    data = yaml.safe_load(user_rules.read_text(encoding="utf-8"))
+    rule = data["rules"][0]
+    assert rule["match_apps"] == ["myapp"]
+    assert rule["default_type"] == "programming"
+    assert rule["source"]["correction_count"] == 3
+    assert rule["source"]["latest_corrected_at"]
+
+
+def test_rule_suggest_edit_writes_edited_rule(tmp_path):
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db", data_dir=tmp_path)
+    storage = Storage(cfg.db_path)
+    for _ in range(3):
+        storage.add_correction("2026-05-30T09:00", "rawapp", "Main", "unknown", "admin")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["rule-suggest"],
+            input="e\nCustom App\nwriting\n0.88\n",
+        )
+
+    assert result.exit_code == 0
+    user_rules = tmp_path / "rules" / "user.yml"
+    data = yaml.safe_load(user_rules.read_text(encoding="utf-8"))
+    rule = data["rules"][0]
+    assert rule["match_apps"] == ["Custom App"]
+    assert rule["default_type"] == "writing"
+    assert rule["confidence"] == 0.88
+
+
+def test_rule_suggest_reject_hides_pending_suggestion(tmp_path):
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db", data_dir=tmp_path)
+    storage = Storage(cfg.db_path)
+    for _ in range(3):
+        storage.add_correction("2026-05-30T09:00", "rejectapp", "Main", "unknown", "admin")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg):
+        runner = CliRunner()
+        result = runner.invoke(main, ["rule-suggest"], input="r\n")
+        assert result.exit_code == 0
+
+        result = runner.invoke(main, ["rule-suggest"])
+
+    assert result.exit_code == 0
+    assert "No pending rule suggestions" in result.output
 
 
 def test_correct_last_records_real_activity(tmp_path):
