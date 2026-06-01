@@ -254,6 +254,9 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     level = logging.DEBUG if verbose else (logging.WARNING if quiet else logging.INFO)
     logging.basicConfig(level=level, format="[%(levelname)s] %(name)s: %(message)s")
     logging.getLogger("aw_coach").setLevel(level)
+    if not verbose:
+        for noisy_logger in ("httpx", "httpcore", "persistqueue"):
+            logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     if ctx.invoked_subcommand is None:
         click.echo(f"aw-coach {__version__}")
@@ -1076,8 +1079,15 @@ def open_dashboard() -> None:
     from aw_coach.report import generate_html_dashboard
 
     html_path = generate_html_dashboard(config, target, analysis, slices, rules)
+    dashboard_url = html_path.resolve().as_uri()
     click.echo(f"Dashboard generated: {html_path}")
-    webbrowser.open(html_path.resolve().as_uri())
+    click.echo(f"访问地址: {dashboard_url}")
+    opened = webbrowser.open(dashboard_url)
+    if opened:
+        click.echo("已尝试使用默认浏览器打开。若未打开，请复制上面的访问地址。")
+    else:
+        click.echo("未能自动打开浏览器，请复制上面的访问地址。")
+    click.echo("提示: 这是静态只读面板；如需点击时间线纠错，运行 `aw-coach serve`。")
 
 
 @main.command()
@@ -1101,9 +1111,11 @@ def serve(port: int, open_browser: bool, date: str) -> None:
         click.echo(f"Could not start dashboard server: {e}", err=True)
         return
 
-    click.echo(f"AI Coach Web: {server.url}")
-    click.echo("Timeline items are clickable; corrections are saved to local SQLite.")
-    click.echo("Press Ctrl+C to stop.")
+    click.echo("AI Coach Web 已启动")
+    click.echo(f"访问地址: {server.url}")
+    click.echo(f"纠错接口: POST {server.url}api/corrections")
+    click.echo("提示: 点击时间线条目可修改分类，纠错会写入本地 SQLite。")
+    click.echo("停止服务: Ctrl+C")
     if open_browser:
         webbrowser.open(server.url)
     try:
