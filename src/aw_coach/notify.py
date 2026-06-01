@@ -171,5 +171,5 @@ def send_notification(
 
     # Fallback to notify-send
     if detail_url:
-        body += "\n📊 运行 `aw-coach open` 查看完整仪表盘"
+        body += "\n📊 运行 `aw-coach serve` 查看交互式仪表盘"
     return _fallback_notify_send(title, body)

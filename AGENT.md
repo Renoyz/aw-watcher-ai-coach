@@ -96,7 +96,6 @@ journalctl --user -u aw-coach -f
 | `status` | 实时工作状态（优先读 bucket，fallback 到原始数据） |
 | `report [date]` | 日报（--full 调用 LLM，--dry-run 输出 prompt） |
 | `weekly` | 周报（过去 7 天汇总） |
-| `open` | 生成 HTML 仪表盘并用浏览器打开 |
 | `doctor` | 环境诊断（aw-server/bucket/rules/platform/cost） |
 | `calibrate` | 扫描未知 app，交互式分类并写入 user.yml |
 | `reclassify --from DATE` | 用最新规则重新分析历史数据 |
@@ -105,6 +104,7 @@ journalctl --user -u aw-coach -f
 | `correct [--last/--time/--interactive]` | 纠正分类结果 |
 | `cost` | AI API 成本监控 |
 | `notify-test` | 测试系统通知 |
+| `serve` | 启动本地交互式 Web 工作台 |
 
 ## 核心架构
 
@@ -220,7 +220,7 @@ PYTHONPATH=src python3 -m pytest tests/test_rules.py -v -p no:anyio
 
 ## 当前已知问题
 
-1. `aw-coach open` 依赖 Chart.js CDN，离线时图表空白
+1. `serve` 页面依赖 Chart.js CDN，离线时图表空白
 2. `report --full` 在 rule_only 模式下只打印提示，不调用 LLM
 3. `correct --interactive` 需要 aw-server 运行
 4. deep_work_threshold 默认 25min 对碎片化工作模式偏高，可通过配置调低

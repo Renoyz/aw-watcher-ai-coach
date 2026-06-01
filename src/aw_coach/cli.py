@@ -1048,48 +1048,6 @@ def _correct_review(
         click.echo("💡 Run `aw-coach rule-suggest` to generate rules.")
 
 
-@main.command("open")
-def open_dashboard() -> None:
-    """Generate and open the static HTML report dashboard."""
-    import webbrowser
-
-    config = load_config()
-    target = date_type.today()
-
-    try:
-        analysis = _get_analysis(target, config)
-    except SystemExit:
-        return
-
-    if analysis is None:
-        click.echo("No data available to generate dashboard.")
-        return
-
-    slices = None
-    rules = None
-    try:
-        from aw_coach.collector import DataCollector
-
-        start = datetime.combine(target, datetime.min.time())
-        slices = DataCollector().fetch_range(start, datetime.now())
-        rules = _classify_slices(config, slices) if slices else None
-    except Exception:
-        pass
-
-    from aw_coach.report import generate_html_dashboard
-
-    html_path = generate_html_dashboard(config, target, analysis, slices, rules)
-    dashboard_url = html_path.resolve().as_uri()
-    click.echo(f"Dashboard generated: {html_path}")
-    click.echo(f"访问地址: {dashboard_url}")
-    opened = webbrowser.open(dashboard_url)
-    if opened:
-        click.echo("已尝试使用默认浏览器打开。若未打开，请复制上面的访问地址。")
-    else:
-        click.echo("未能自动打开浏览器，请复制上面的访问地址。")
-    click.echo("提示: 这是静态只读面板；如需点击时间线纠错，运行 `aw-coach serve`。")
-
-
 @main.command()
 @click.option("--port", default=5601, show_default=True, help="Local server port")
 @click.option("--open/--no-open", "open_browser", default=True, help="Open browser automatically")

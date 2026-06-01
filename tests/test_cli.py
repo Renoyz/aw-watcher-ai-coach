@@ -9,7 +9,6 @@ from unittest.mock import patch
 import yaml
 from click.testing import CliRunner
 
-from aw_coach.analyzer import AnalysisResult
 from aw_coach.cli import main
 from aw_coach.collector import ActivitySlice, DataCollector
 from aw_coach.config import Config, load_config
@@ -266,33 +265,6 @@ def test_rule_suggest_reject_hides_pending_suggestion(tmp_path):
 
     assert result.exit_code == 0
     assert "No pending rule suggestions" in result.output
-
-
-def test_open_dashboard_prints_file_url_and_hints(tmp_path):
-    cfg = SimpleNamespace(reports_dir=tmp_path)
-    analysis = AnalysisResult(
-        total_hours=1.0,
-        effective_hours=0.8,
-        deep_work_hours=0.4,
-        focus_score=70,
-        switch_count=2,
-        activity_breakdown={"programming": 0.8},
-        hourly_scores=[(9, 70)],
-    )
-    html_path = tmp_path / "web" / "index.html"
-
-    with patch("aw_coach.cli.load_config", return_value=cfg), \
-         patch("aw_coach.cli._get_analysis", return_value=analysis), \
-         patch("aw_coach.report.generate_html_dashboard", return_value=html_path), \
-         patch.object(DataCollector, "__init__", side_effect=RuntimeError("skip")), \
-         patch("webbrowser.open", return_value=False):
-        runner = CliRunner()
-        result = runner.invoke(main, ["open"])
-
-    assert result.exit_code == 0
-    assert f"访问地址: {html_path.resolve().as_uri()}" in result.output
-    assert "未能自动打开浏览器" in result.output
-    assert "aw-coach serve" in result.output
 
 
 def test_correct_last_records_real_activity(tmp_path):
