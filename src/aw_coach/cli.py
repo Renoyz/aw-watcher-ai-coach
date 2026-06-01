@@ -270,6 +270,7 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         click.echo("  rule-test   Test rule engine matching")
         click.echo("  cost         View AI API cost usage")
         click.echo("  notify-test  Send a test notification")
+        click.echo("  serve       Start interactive local dashboard")
         click.echo()
         click.echo("Run `aw-coach --help` for all commands.")
 
@@ -1046,8 +1047,7 @@ def _correct_review(
 
 @main.command("open")
 def open_dashboard() -> None:
-    """Open HTML report dashboard in browser."""
-    import time
+    """Generate and open the static HTML report dashboard."""
     import webbrowser
 
     config = load_config()
@@ -1062,21 +1062,56 @@ def open_dashboard() -> None:
         click.echo("No data available to generate dashboard.")
         return
 
-    from aw_coach.report import generate_html_dashboard
-    from aw_coach.webserver import ReportServer
+    slices = None
+    rules = None
+    try:
+        from aw_coach.collector import DataCollector
 
-    html_path = generate_html_dashboard(config, target, analysis)
-    server = ReportServer(html_path.parent)
-    server.start()
-    click.echo(f"Dashboard server: {server.dashboard_url}")
+        start = datetime.combine(target, datetime.min.time())
+        slices = DataCollector().fetch_range(start, datetime.now())
+        rules = _classify_slices(config, slices) if slices else None
+    except Exception:
+        pass
+
+    from aw_coach.report import generate_html_dashboard
+
+    html_path = generate_html_dashboard(config, target, analysis, slices, rules)
+    click.echo(f"Dashboard generated: {html_path}")
+    webbrowser.open(html_path.resolve().as_uri())
+
+
+@main.command()
+@click.option("--port", default=5601, show_default=True, help="Local server port")
+@click.option("--open/--no-open", "open_browser", default=True, help="Open browser automatically")
+@click.argument("date", default="today")
+def serve(port: int, open_browser: bool, date: str) -> None:
+    """Start an interactive local dashboard with correction API."""
+    import time
+    import webbrowser
+
+    config = load_config()
+    target = _parse_date(date)
+
+    from aw_coach.web.server import InteractiveReportServer
+
+    try:
+        server = InteractiveReportServer(config, target, port=port)
+        server.start()
+    except Exception as e:
+        click.echo(f"Could not start dashboard server: {e}", err=True)
+        return
+
+    click.echo(f"AI Coach Web: {server.url}")
+    click.echo("Timeline items are clickable; corrections are saved to local SQLite.")
     click.echo("Press Ctrl+C to stop.")
-    webbrowser.open(server.dashboard_url)
+    if open_browser:
+        webbrowser.open(server.url)
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         server.stop()
-        click.echo("\nDashboard server stopped.")
+        click.echo("\nAI Coach Web stopped.")
 
 
 @main.command()

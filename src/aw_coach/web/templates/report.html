@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Coach Report - {{ target_date }}</title>
+<style>
+body {
+  margin: 0;
+  background: #f7f8fb;
+  color: #172033;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6;
+}
+main {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 28px 16px 48px;
+}
+pre {
+  white-space: pre-wrap;
+  background: #fff;
+  border: 1px solid #d9dee8;
+  border-radius: 8px;
+  padding: 18px;
+}
+</style>
+</head>
+<body>
+<main>
+<pre>{{ report_markdown }}</pre>
+</main>
+</body>
+</html>

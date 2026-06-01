@@ -22,6 +22,8 @@ with ZipFile(wheels[-1]) as wheel:
 for required in (
     "aw_coach/rules/builtin/cn.yml",
     "aw_coach/rules/builtin/global.yml",
+    "aw_coach/web/templates/dashboard.html",
+    "aw_coach/web/templates/report.html",
 ):
     if required not in names:
         raise SystemExit(f"Missing packaged data: {required}")

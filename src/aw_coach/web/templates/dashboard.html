@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Coach - {{ target_date }}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+:root {
+  --bg: #f7f8fb;
+  --panel: #ffffff;
+  --text: #172033;
+  --muted: #667085;
+  --border: #d9dee8;
+  --primary: #2563eb;
+  --danger: #dc2626;
+  --success: #059669;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f172a;
+    --panel: #182235;
+    --text: #eef2ff;
+    --muted: #a7b0c2;
+    --border: #334155;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+main {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 24px 16px 40px;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+.date { color: var(--muted); }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.card, .chart-box, .section-body {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.card {
+  padding: 14px;
+}
+.value {
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: var(--primary);
+}
+.label {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.danger .value { color: var(--danger); }
+.charts {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+@media (min-width: 760px) {
+  .charts { grid-template-columns: 1fr 1fr; }
+}
+.chart-box {
+  min-height: 280px;
+  padding: 14px;
+}
+.section { margin-top: 22px; }
+.section h2 {
+  margin: 0 0 10px;
+  font-size: 1rem;
+}
+.section-body {
+  padding: 12px;
+}
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.timeline-item {
+  display: flex;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--primary);
+  border-radius: 8px;
+}
+.timeline-clickable {
+  cursor: pointer;
+}
+.timeline-clickable:hover {
+  border-color: var(--primary);
+}
+.timeline-time {
+  width: 96px;
+  flex-shrink: 0;
+  color: var(--primary);
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+.timeline-content { min-width: 0; }
+.timeline-activity { font-weight: 700; }
+.confidence {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.82rem;
+}
+.timeline-apps, .timeline-duration, .timeline-titles {
+  color: var(--muted);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+.suggestions ul {
+  margin: 0;
+  padding-left: 20px;
+}
+.loop-item {
+  color: var(--danger);
+  padding: 4px 0;
+}
+.empty {
+  color: var(--muted);
+  margin: 0;
+}
+.correction-status {
+  margin: 0 0 10px;
+  color: var(--success);
+  font-size: 0.9rem;
+}
+.correction-status.error { color: var(--danger); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AI Coach Dashboard</h1>
+    <div class="date">{{ target_date }}</div>
+  </header>
+
+  <section class="cards">
+    <div class="card"><div class="value">{{ effective_hours }}h</div><div class="label">有效工作</div></div>
+    <div class="card"><div class="value">{{ deep_work_hours }}h</div><div class="label">深度工作</div></div>
+    <div class="card"><div class="value">{{ focus_score }}</div><div class="label">专注得分</div></div>
+    <div class="card"><div class="value">{{ productivity_score }}</div><div class="label">生产力得分</div></div>
+    <div class="card danger"><div class="value">{{ switch_count }}</div><div class="label">任务切换</div></div>
+    <div class="card danger"><div class="value">{{ death_loop_count }}</div><div class="label">切换循环</div></div>
+  </section>
+
+  <section class="charts">
+    <div class="chart-box"><canvas id="pieChart"></canvas></div>
+    <div class="chart-box"><canvas id="lineChart"></canvas></div>
+  </section>
+
+  <section class="section">
+    <h2>时间线</h2>
+    {{ correction_panel }}
+    <div class="timeline">{{ timeline_html }}</div>
+  </section>
+
+  <section class="section">
+    <h2>切换循环</h2>
+    <div class="section-body">{{ death_loops_html }}</div>
+  </section>
+
+  <section class="section">
+    <h2>建议</h2>
+    <div class="section-body suggestions"><ul>{{ suggestions_html }}</ul></div>
+  </section>
+</main>
+
+<script>
+new Chart(document.getElementById("pieChart"), {
+  type: "doughnut",
+  data: {
+    labels: {{ labels_json }},
+    datasets: [{
+      data: {{ values_json }},
+      backgroundColor: ["#2563eb", "#d97706", "#059669", "#7c3aed", "#dc2626", "#64748b"],
+      borderWidth: 0
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { title: { display: true, text: "时间分布" }, legend: { position: "bottom" } }
+  }
+});
+
+new Chart(document.getElementById("lineChart"), {
+  type: "line",
+  data: {
+    labels: {{ hourly_labels_json }},
+    datasets: [{
+      label: "专注度",
+      data: {{ hourly_values_json }},
+      borderColor: "#2563eb",
+      backgroundColor: "rgba(37,99,235,0.10)",
+      tension: 0.3,
+      fill: true
+    }]
+  },
+  options: {
+    responsive: true,
+    scales: { y: { min: 0, max: 100 } },
+    plugins: { title: { display: true, text: "精力曲线" } }
+  }
+});
+</script>
+<script>{{ interactive_script }}</script>
+</body>
+</html>
