@@ -1,0 +1,54 @@
+[project]
+name = "aw-watcher-ai-coach"
+version = "0.1.0"
+description = "AI Coach for ActivityWatch - intelligent work pattern analysis"
+requires-python = ">=3.9"
+dependencies = [
+    "aw-client>=0.5.0",
+    "click>=8.0",
+    "pydantic>=2.0",
+    "tomli>=2.0; python_version < '3.11'",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+aw-coach = "aw_coach.cli:main"
+aw-coach-daemon = "aw_coach.daemon:main"
+
+[project.optional-dependencies]
+ai = ["openai>=1.0", "httpx>=0.25"]
+screenshot = ["mss>=9.0", "pillow>=10.0"]
+web = ["flask>=3.0", "jinja2>=3.1"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "mypy>=1.5",
+]
+
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aw_coach = ["rules/builtin/*.yml"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -q"

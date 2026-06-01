@@ -1,0 +1,16 @@
+[Unit]
+Description=ActivityWatch AI Coach - work pattern analysis
+Documentation=https://github.com/user/aw-watcher-ai-coach
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aw-coach-daemon
+Restart=on-failure
+RestartSec=30
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=graphical-session.target

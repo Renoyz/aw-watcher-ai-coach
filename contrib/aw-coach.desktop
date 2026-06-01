@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ActivityWatch AI Coach
+Comment=AI-powered work pattern analysis
+Exec=aw-coach-daemon
+Type=Application
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

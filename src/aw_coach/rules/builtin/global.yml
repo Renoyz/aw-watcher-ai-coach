@@ -1,0 +1,203 @@
+rules:
+  # === IDEs & Editors ===
+  - name: vscode
+    match_apps: ["code", "code - insiders", "vscodium", "cursor"]
+    default_type: programming
+    confidence: 0.90
+
+  - name: intellij
+    match_apps: ["idea", "idea64", "intellij", "pycharm", "webstorm", "goland", "clion", "rustrover", "android studio"]
+    default_type: programming
+    confidence: 0.90
+
+  - name: vim
+    match_apps: ["vim", "nvim", "neovim", "gvim"]
+    default_type: programming
+    confidence: 0.85
+
+  - name: sublime
+    match_apps: ["sublime_text", "subl"]
+    default_type: programming
+    confidence: 0.85
+
+  - name: emacs
+    match_apps: ["emacs", "emacs-gtk"]
+    default_type: programming
+    confidence: 0.85
+
+  - name: xcode
+    match_apps: ["xcode"]
+    default_type: programming
+    confidence: 0.90
+
+  # === Terminals ===
+  - name: terminal
+    match_apps: ["terminal", "iterm2", "iterm", "konsole", "alacritty", "kitty", "wezterm", "gnome-terminal", "tilix", "hyper", "warp", "tabby"]
+    default_type: programming
+    confidence: 0.85
+
+  # === Browsers ===
+  - name: browser
+    match_apps: ["chrome", "chromium", "firefox", "safari", "edge", "arc", "brave", "vivaldi", "opera"]
+    default_type: research
+    confidence: 0.50
+    sub_rules:
+      - match_titles: ["youtube", "netflix", "twitch", "hulu", "disney+", "bilibili"]
+        type: entertainment
+        confidence: 0.95
+      - match_urls: ["youtube.com", "netflix.com", "twitch.tv", "hulu.com", "bilibili.com"]
+        type: entertainment
+        confidence: 0.95
+      - match_titles: ["reddit", "twitter", "x.com", "instagram", "tiktok", "facebook"]
+        type: entertainment
+        confidence: 0.90
+      - match_urls: ["reddit.com", "twitter.com", "x.com", "instagram.com", "tiktok.com", "facebook.com"]
+        type: entertainment
+        confidence: 0.90
+      - match_urls: ["github.com", "gitlab.com", "bitbucket.org", "stackoverflow.com", "stackexchange.com"]
+        type: programming
+        confidence: 0.80
+      - match_titles: ["github", "gitlab", "stackoverflow", "stack overflow"]
+        type: programming
+        confidence: 0.80
+      - match_urls: ["jira.atlassian.com", "confluence.atlassian.com", "trello.com", "notion.so", "linear.app", "asana.com"]
+        type: admin
+        confidence: 0.85
+      - match_titles: ["jira", "confluence", "trello", "notion", "linear", "asana"]
+        type: admin
+        confidence: 0.80
+      - match_urls: ["docs.google.com", "docs.new"]
+        type: writing
+        confidence: 0.80
+
+  # === Communication (default: meeting) ===
+  - name: zoom
+    match_apps: ["zoom", "zoom.us"]
+    default_type: meeting
+    confidence: 0.90
+
+  - name: teams
+    match_apps: ["teams", "microsoft teams"]
+    default_type: meeting
+    confidence: 0.85
+
+  - name: slack
+    match_apps: ["slack"]
+    default_type: social
+    confidence: 0.75
+
+  - name: discord
+    match_apps: ["discord"]
+    default_type: social
+    confidence: 0.75
+
+  - name: telegram
+    match_apps: ["telegram", "telegram-desktop"]
+    default_type: social
+    confidence: 0.75
+
+  # === Design ===
+  - name: figma
+    match_apps: ["figma"]
+    default_type: design
+    confidence: 0.90
+
+  - name: sketch
+    match_apps: ["sketch"]
+    default_type: design
+    confidence: 0.90
+
+  - name: photoshop
+    match_apps: ["photoshop", "adobe photoshop"]
+    default_type: design
+    confidence: 0.90
+
+  - name: illustrator
+    match_apps: ["illustrator", "adobe illustrator"]
+    default_type: design
+    confidence: 0.90
+
+  - name: blender
+    match_apps: ["blender"]
+    default_type: design
+    confidence: 0.85
+
+  # === Documents / Writing ===
+  - name: obsidian
+    match_apps: ["obsidian"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: word
+    match_apps: ["word", "microsoft word", "winword"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: pages
+    match_apps: ["pages"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: typora
+    match_apps: ["typora"]
+    default_type: writing
+    confidence: 0.85
+
+  # === Admin / Productivity ===
+  - name: mail
+    match_apps: ["mail", "thunderbird", "outlook", "microsoft outlook", "spark"]
+    default_type: admin
+    confidence: 0.80
+
+  - name: calendar
+    match_apps: ["calendar", "fantastical", "itsycal"]
+    default_type: admin
+    confidence: 0.85
+
+  # === Sensitive (never screenshot) ===
+  - name: password_managers
+    match_apps: ["1password", "keepassxc", "keepass", "lastpass", "bitwarden", "dashlane"]
+    default_type: sensitive
+    confidence: 1.0
+    skip_screenshot: true
+    skip_analysis: true
+
+  # === Linux Desktop / GNOME ===
+  - name: file_managers
+    match_apps: ["nautilus", "org.gnome.nautilus", "thunar", "dolphin", "nemo", "pcmanfm", "file-roller"]
+    default_type: admin
+    confidence: 0.70
+
+  - name: gnome_system
+    match_apps: ["gjs", "xdg-desktop-portal-gnome", "gnome-shell", "gnome-control-center", "gnome-settings"]
+    default_type: admin
+    confidence: 0.60
+
+  - name: gedit
+    match_apps: ["gedit", "org.gnome.gedit", "org.gnome.texteditor", "mousepad", "kate", "kwrite"]
+    default_type: writing
+    confidence: 0.75
+
+  - name: firefox_variants
+    match_apps: ["firefox_firefox", "firefox-esr", "librewolf"]
+    default_type: research
+    confidence: 0.50
+    sub_rules:
+      - match_titles: ["youtube", "netflix", "twitch", "bilibili"]
+        type: entertainment
+        confidence: 0.95
+      - match_urls: ["youtube.com", "netflix.com", "twitch.tv", "bilibili.com"]
+        type: entertainment
+        confidence: 0.95
+      - match_titles: ["reddit", "twitter", "x.com", "tiktok"]
+        type: entertainment
+        confidence: 0.90
+      - match_urls: ["github.com", "gitlab.com", "stackoverflow.com"]
+        type: programming
+        confidence: 0.80
+      - match_titles: ["github", "gitlab", "stackoverflow"]
+        type: programming
+        confidence: 0.80
+      - match_urls: ["jira.atlassian.com", "confluence.atlassian.com", "notion.so"]
+        type: admin
+        confidence: 0.85

@@ -1,0 +1,106 @@
+rules:
+  # === 通信 & 会议 ===
+  - name: feishu
+    match_apps: ["lark", "feishu", "bytedance-feishu"]
+    default_type: meeting
+    confidence: 0.85
+    sub_rules:
+      - match_titles: ["飞书会议", "meeting", "视频会议"]
+        type: meeting
+        confidence: 0.95
+      - match_titles: ["飞书文档", "云文档"]
+        type: writing
+        confidence: 0.85
+
+  - name: dingtalk
+    match_apps: ["dingtalk", "钉钉"]
+    default_type: meeting
+    confidence: 0.85
+    sub_rules:
+      - match_titles: ["视频会议", "电话会议"]
+        type: meeting
+        confidence: 0.95
+
+  - name: wxwork
+    match_apps: ["wxwork", "企业微信", "wecom"]
+    default_type: meeting
+    confidence: 0.80
+    sub_rules:
+      - match_titles: ["会议", "meeting"]
+        type: meeting
+        confidence: 0.95
+
+  - name: wechat
+    match_apps: ["wechat", "微信", "weixin"]
+    default_type: social
+    confidence: 0.80
+
+  - name: qq
+    match_apps: ["qq", "腾讯qq"]
+    default_type: social
+    confidence: 0.80
+
+  - name: wemeet
+    match_apps: ["wemeet", "腾讯会议", "tencent meeting"]
+    default_type: meeting
+    confidence: 0.90
+
+  # === 办公 & 文档 ===
+  - name: wps
+    match_apps: ["wps", "wps office", "et", "wpp", "wpspdf"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: yuque
+    match_apps: ["yuque", "语雀"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: shimo
+    match_apps: ["shimo", "石墨文档"]
+    default_type: writing
+    confidence: 0.85
+
+  - name: mubu
+    match_apps: ["mubu", "幕布"]
+    default_type: writing
+    confidence: 0.85
+
+  # === 开发工具 ===
+  - name: hbuilderx
+    match_apps: ["hbuilderx", "hbuilder"]
+    default_type: programming
+    confidence: 0.90
+
+  # === 娱乐 (浏览器中已通过 sub_rules 匹配，这里覆盖本地客户端) ===
+  - name: bilibili_app
+    match_apps: ["bilibili", "哔哩哔哩"]
+    default_type: entertainment
+    confidence: 0.95
+
+  - name: douyin
+    match_apps: ["douyin", "抖音"]
+    default_type: entertainment
+    confidence: 0.95
+
+  # === 浏览器标题补充规则 ===
+  - name: browser_cn
+    match_apps: ["chrome", "chromium", "firefox", "edge"]
+    default_type: research
+    confidence: 0.50
+    sub_rules:
+      - match_titles: ["bilibili", "哔哩哔哩", "b站"]
+        type: entertainment
+        confidence: 0.95
+      - match_urls: ["bilibili.com", "zhihu.com"]
+        type: entertainment
+        confidence: 0.85
+      - match_titles: ["知乎"]
+        type: research
+        confidence: 0.65
+      - match_urls: ["juejin.cn", "segmentfault.com", "csdn.net"]
+        type: programming
+        confidence: 0.75
+      - match_titles: ["掘金", "csdn"]
+        type: programming
+        confidence: 0.75
