@@ -55,14 +55,14 @@ class TestEndToEndHybrid:
     def test_full_pipeline(self, tmp_path):
         """
         End-to-end: slices → hybrid classify → analyze → report.
-        LLM is called only for the 'mystery-tool' slice.
+        LLM is called only for the firefox/github slice.
+        mystery-tool (confidence 0.0) skips queue via rule_low_conf fallback.
         """
         storage = Storage(tmp_path / "e2e.db")
         rule_engine = RuleEngine.with_builtin_rules()
         mock_llm = MagicMock(spec=AIBackend)
         mock_llm.estimate_cost.return_value = 0.01
         mock_llm.batch_classify.return_value = [
-            ClassificationResult("admin", 0.75, "llm_batch"),
             ClassificationResult("programming", 0.85, "llm_batch"),
         ]
         cost = CostController(CostConfig(monthly_budget_usd=5.0), storage)
@@ -74,14 +74,14 @@ class TestEndToEndHybrid:
         results = hybrid.batch_classify(slices)
         assert len(results) == 5
         assert results[0].activity_type == "programming"   # Cursor → rule (0.90)
-        assert results[1].activity_type == "admin"          # mystery → LLM
-        assert results[2].activity_type == "programming"    # GitHub → LLM (rule=0.80 < threshold)
+        assert results[1].activity_type == "unknown"       # mystery → rule_low_conf
+        assert results[2].activity_type == "programming"   # GitHub → LLM (rule=0.80 < threshold)
         assert results[4].activity_type == "programming"    # Cursor → rule
 
-        # LLM called with 2 uncertain slices (mystery-tool + firefox/github)
+        # LLM called with 1 uncertain slice (firefox/github)
         mock_llm.batch_classify.assert_called_once()
         call_args = mock_llm.batch_classify.call_args[0][0]
-        assert len(call_args) == 2
+        assert len(call_args) == 1
 
         # 2. Analyze
         analyzer = PatternAnalyzer(AnalysisConfig())

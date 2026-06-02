@@ -30,15 +30,23 @@ class ReportGenerator:
         self.config = config
 
     def generate_daily(
-        self, report_date: date, analysis: AnalysisResult, use_ai: bool = False
+        self,
+        report_date: date,
+        analysis: AnalysisResult,
+        use_ai: bool = False,
+        project_breakdown: Optional[Dict[str, float]] = None,
     ) -> str:
         sections = [
             self._header(report_date),
             self._overview_table(analysis),
+        ]
+        if project_breakdown:
+            sections.append(self._project_breakdown_section(project_breakdown))
+        sections.extend([
             self._breakdown_section(analysis),
             self._energy_curve(analysis),
             self._suggestions_section(analysis, use_ai=use_ai),
-        ]
+        ])
         return "\n\n".join(sections)
 
     def generate_status(self, analysis: AnalysisResult) -> str:
@@ -90,6 +98,16 @@ class ReportGenerator:
 | 深度工作时长 | {analysis.deep_work_hours:.2f}h |
 | 专注得分 | {analysis.focus_score}/100 |
 {productivity_line}| 任务切换 | {analysis.switch_count} 次 |"""
+
+    def _project_breakdown_section(self, project_breakdown: Dict[str, float]) -> str:
+        if not project_breakdown:
+            return ""
+        lines = ["## 项目分布", ""]
+        max_hours = max(project_breakdown.values())
+        for project, hours in sorted(project_breakdown.items(), key=lambda x: -x[1]):
+            bar = _bar(hours, max_hours, 20)
+            lines.append(f"  {project:<20} {bar} {hours:.1f}h")
+        return "\n".join(lines)
 
     def _breakdown_section(self, analysis: AnalysisResult) -> str:
         if not analysis.activity_breakdown:

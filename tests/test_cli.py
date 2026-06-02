@@ -94,7 +94,7 @@ def test_config_show_command():
         result = runner.invoke(main, ["config", "show"])
 
     assert result.exit_code == 0
-    assert '"backend": "rule_only"' in result.output
+    assert '"backend": "hybrid"' in result.output
 
 
 def test_config_set_writes_values(monkeypatch, tmp_path):

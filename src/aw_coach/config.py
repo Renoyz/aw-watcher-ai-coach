@@ -24,7 +24,7 @@ DEFAULT_DATA_DIR = Path("~/.local/share/activitywatch/aw-watcher-ai-coach").expa
 
 
 class AnalysisConfig(BaseModel):
-    deep_work_threshold_minutes: int = 25
+    deep_work_threshold_minutes: int = 15
     distraction_apps: List[str] = [
         "youtube", "bilibili", "twitter", "reddit", "tiktok"
     ]
@@ -43,13 +43,13 @@ class ReportConfig(BaseModel):
 
 class OpenAIConfig(BaseModel):
     """OpenAI-compatible API config. Also works for DeepSeek:
-    base_url = "https://api.deepseek.com", model = "deepseek-v4-flash"
+    base_url = "https://api.deepseek.com/v1", model = "deepseek-v4-flash"
     (deepseek-chat / deepseek-reasoner are deprecated on 2026-07-24)
     """
 
     api_key: str = ""
-    model: str = "gpt-4o-mini"
-    base_url: str = "https://api.openai.com/v1"
+    model: str = "deepseek-v4-flash"
+    base_url: str = "https://api.deepseek.com/v1"
 
 
 class LocalLLMConfig(BaseModel):
@@ -59,7 +59,7 @@ class LocalLLMConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    backend: str = "rule_only"
+    backend: str = "hybrid"
     openai: OpenAIConfig = OpenAIConfig()
     local: LocalLLMConfig = LocalLLMConfig()
 
@@ -72,12 +72,12 @@ class AIConfig(BaseModel):
 
 
 class CostConfig(BaseModel):
-    monthly_budget_usd: float = 5.0
+    monthly_budget_usd: float = 2.86  # ~¥20/month at 2026-06 exchange rate
     alert_thresholds: List[float] = [0.5, 0.8, 1.0]
 
 
 class ScreenshotConfig(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     retention_hours: int = 0
     blocklist_apps: List[str] = ["1password", "keepass", "bank", "password"]
 

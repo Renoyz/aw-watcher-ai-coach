@@ -64,7 +64,7 @@ rules:
 
   # === Browsers ===
   - name: browser
-    match_apps: ["chrome", "chromium", "firefox", "safari", "edge", "arc", "brave", "vivaldi", "opera"]
+    match_apps: ["chrome", "chromium", "firefox", "safari", "edge", "arc", "brave", "vivaldi", "opera", "firefox_firefox", "librewolf", "firefox-esr"]
     default_type: research
     confidence: 0.50
     sub_rules:

@@ -7,7 +7,7 @@ import signal
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from aw_coach.analyzer import PatternAnalyzer
 from aw_coach.classifier import create_classifier
@@ -19,6 +19,8 @@ from aw_coach.report import ReportGenerator, generate_html_dashboard
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from aw_coach.context_stack import ContextStack
+    from aw_coach.screenshot import ScreenshotTrigger
     from aw_coach.storage import Storage
 
 
@@ -39,6 +41,21 @@ class CoachScheduler:
         self._bucket_created = False
         self._storage: Optional["Storage"] = None
 
+        # Phase 1: semantic enrichment (lazy init)
+        self._enricher = None
+        self._chain_analyzer = None
+        self._semantic_state_json: Optional[str] = None
+
+        # Context Stack (Phase 1+): track primary context across interrupts
+        self._context_stack: Optional["ContextStack"] = None
+
+        # Screenshot analysis (lightweight visual signal)
+        self._screenshot_trigger: Optional["ScreenshotTrigger"] = None
+        self._last_screenshot_image = None
+
+        # Change-only snapshot tracking
+        self._last_snapshot_payload: Optional[Dict] = None
+
     @property
     def storage(self):
         if self._storage is None:
@@ -50,6 +67,206 @@ class CoachScheduler:
     def _classify_slices(self, slices):
         """Classify slices using either RuleEngine or HybridBackend."""
         return self.classifier.batch_classify(slices)
+
+    # ------------------------------------------------------------------
+    # Phase 1: semantic enrichment (per-minute state update)
+    # ------------------------------------------------------------------
+
+    def _update_semantic_state(self, now: datetime) -> None:
+        """Fetch recent activity, enrich with semantics, persist to SQLite."""
+        try:
+            from aw_coach.chain_analyzer import ChainAnalyzer
+            from aw_coach.enriched_state import EnrichedStateAssembler
+            from aw_coach.rules.engine import RuleEngine
+
+            if self._enricher is None:
+                self._enricher = EnrichedStateAssembler()
+            if self._chain_analyzer is None:
+                self._chain_analyzer = ChainAnalyzer()
+
+            start = now - timedelta(minutes=30)
+            slices = [
+                s for s in self.collector.fetch_range(start, now)
+                if not s.is_afk and getattr(s, "duration", 0) >= 3
+            ]
+            if not slices:
+                return
+
+            # Align timezone: slices may be offset-aware while `now` is naive
+            _tz = getattr(slices[0].end, "tzinfo", None)
+            if _tz and now.tzinfo is None:
+                now = now.replace(tzinfo=_tz)
+
+            engine = RuleEngine.with_all_rules()
+            latest = max(slices, key=lambda s: s.end)
+            rule = engine.classify(
+                latest.primary_app, latest.primary_title, latest.web_url
+            )
+
+            # Rough block duration
+            block_sec = 0
+            for s in reversed(sorted(slices, key=lambda s: s.end)):
+                s_rule = engine.classify(
+                    s.primary_app, s.primary_title, s.web_url
+                )
+                if s_rule.activity_type == rule.activity_type:
+                    block_sec += getattr(s, "duration", 60)
+                else:
+                    break
+
+            # Switches in last 5 min
+            recent_start = now - timedelta(minutes=5)
+            recent = [s for s in slices if s.end >= recent_start]
+            switches = 0
+            if len(recent) >= 2:
+                sorted_recent = sorted(recent, key=lambda s: s.end)
+                types = [
+                    engine.classify(r.primary_app, r.primary_title, r.web_url).activity_type
+                    for r in sorted_recent
+                ]
+                switches = sum(
+                    1 for i in range(len(types) - 1) if types[i] != types[i + 1]
+                )
+
+            state = self._enricher.assemble(
+                app=latest.primary_app,
+                title=latest.primary_title,
+                url=getattr(latest, "web_url", None),
+                active_block_minutes=block_sec // 60,
+                rule_activity=rule.activity_type,
+                switches_last_5min=switches,
+            )
+
+            # --- Context Stack update -------------------------------------
+            if self._context_stack is None:
+                from aw_coach.context_stack import ContextStack
+                self._context_stack = ContextStack()
+            self._context_stack.update(state, now)
+            # Override active_block_minutes with context-stack accumulated time
+            cs_minutes = self._context_stack.get_active_block_minutes()
+            if cs_minutes > 0:
+                # Re-assemble with corrected block time
+                state = self._enricher.assemble(
+                    app=latest.primary_app,
+                    title=latest.primary_title,
+                    url=getattr(latest, "web_url", None),
+                    active_block_minutes=cs_minutes,
+                    rule_activity=rule.activity_type,
+                    switches_last_5min=switches,
+                )
+            # ---------------------------------------------------------------
+
+            # Chain analysis (last 10 slices)
+            chain_records = []
+            for s in sorted(slices, key=lambda s: s.end)[-10:]:
+                sr = engine.classify(s.primary_app, s.primary_title, s.web_url)
+                chain_records.append(
+                    self._enricher.assemble(
+                        app=s.primary_app,
+                        title=s.primary_title,
+                        url=getattr(s, "web_url", None),
+                        active_block_minutes=getattr(s, "duration", 60) // 60,
+                        rule_activity=sr.activity_type,
+                    )
+                )
+            chain = self._chain_analyzer.analyze(chain_records)
+
+            # --- Screenshot analysis (optional lightweight visual signal) ---
+            screenshot_result = None
+            try:
+                from aw_coach.screenshot import (
+                    ScreenshotTrigger,
+                    capture_and_analyze,
+                    capture_screen,
+                )
+
+                if self._screenshot_trigger is None:
+                    self._screenshot_trigger = ScreenshotTrigger()
+                screenshot_result = capture_and_analyze(
+                    state, self._screenshot_trigger, self._last_screenshot_image
+                )
+                if screenshot_result:
+                    self._last_screenshot_image = capture_screen()
+            except Exception:
+                logger.debug("Screenshot analysis failed", exc_info=True)
+            # ---------------------------------------------------------------
+
+            import json
+
+            payload = {
+                "state": state.to_dict(),
+                "chain": {
+                    "pattern": chain.pattern,
+                    "depth_score": chain.depth_score,
+                    "fragmentation_score": chain.fragmentation_score,
+                    "insight": chain.insight,
+                },
+                "context_stack": self._context_stack.to_dict(),
+            }
+            if screenshot_result:
+                payload["screenshot"] = {
+                    "diff_ratio": screenshot_result.diff_ratio,
+                    "content_type": screenshot_result.content_type,
+                    "brightness": screenshot_result.brightness,
+                    "ocr_text": screenshot_result.ocr_text,
+                    "trigger_reason": screenshot_result.trigger_reason,
+                }
+            self._semantic_state_json = json.dumps(payload, ensure_ascii=False)
+            self.storage.set_scheduler_state("semantic_state", self._semantic_state_json)
+
+            # Change-only snapshot: persist only when state meaningfully changes
+            change_reason = self._detect_change(self._last_snapshot_payload, payload)
+            if change_reason:
+                try:
+                    self.storage.save_state_snapshot(
+                        self._semantic_state_json, change_reason
+                    )
+                    self._last_snapshot_payload = payload
+                    logger.info(
+                        f"State snapshot saved: {change_reason} | "
+                        f"mode={state.likely_mode}, project={state.semantic_project}, "
+                        f"risk={state.risk_level}"
+                    )
+                except Exception:
+                    logger.debug("State snapshot save failed", exc_info=True)
+
+            interrupt = self._context_stack.get_interruption_summary()
+            logger.debug(
+                f"Semantic state updated: mode={state.likely_mode}, "
+                f"risk={state.risk_level}, pattern={chain.pattern}, "
+                f"cs_depth={self._context_stack.depth}, "
+                f"cs_minutes={cs_minutes}"
+                + (f", interrupt={interrupt}" if interrupt else "")
+            )
+        except Exception:
+            logger.debug("Semantic state update failed", exc_info=True)
+
+    def _detect_change(self, prev: Optional[Dict], curr: Dict) -> Optional[str]:
+        """Detect whether current state is meaningfully different from previous snapshot.
+
+        Returns a change_reason string if a snapshot should be saved, or None if unchanged.
+        """
+        if prev is None:
+            return "first_run"
+        ps = prev.get("state", {})
+        cs = curr.get("state", {})
+        if ps.get("likely_mode") != cs.get("likely_mode"):
+            return "mode_change"
+        if ps.get("semantic_project") != cs.get("semantic_project"):
+            return "project_change"
+        if ps.get("risk_level") != cs.get("risk_level"):
+            return "risk_change"
+        p_cs = prev.get("context_stack", {})
+        c_cs = curr.get("context_stack", {})
+        if p_cs.get("depth") != c_cs.get("depth"):
+            return "cs_depth_change"
+        p_ss = prev.get("screenshot")
+        c_ss = curr.get("screenshot")
+        if c_ss and c_ss.get("ocr_text") and (
+            not p_ss or p_ss.get("ocr_text") != c_ss.get("ocr_text")
+        ):
+            return "screenshot_trigger"
+        return None
 
     @property
     def collector(self) -> DataCollector:
@@ -126,6 +343,12 @@ class CoachScheduler:
 
         while self._running:
             now = datetime.now()
+
+            # Phase 1: per-minute semantic state update
+            try:
+                self._update_semantic_state(now)
+            except Exception:
+                logger.debug("Semantic state update error in loop", exc_info=True)
 
             # Hourly analysis - aligned to clock hours
             next_hour = last_hourly + timedelta(hours=1)

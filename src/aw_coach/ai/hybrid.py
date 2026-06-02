@@ -21,21 +21,25 @@ class HybridBackend:
         llm_backend: AIBackend,
         cost_controller: CostController,
         threshold: float = 0.85,
+        low_confidence_threshold: float = 0.5,
         storage: Optional[Storage] = None,
     ):
         self.rules = rule_engine
         self.llm = llm_backend
         self.cost = cost_controller
         self.threshold = threshold
+        self.low_confidence_threshold = low_confidence_threshold
         self.storage = storage
 
     def batch_classify(self, slices: List[ActivitySlice]) -> List[ClassificationResult]:
         """Classify slices: rules first, uncertain ones go to LLM immediately.
         If storage is provided, uncertain slices are also logged to batch_queue.
+        Very low-confidence slices skip the queue and fall back to rule-based.
         """
         results: List[Optional[ClassificationResult]] = []
         uncertain_indices: List[int] = []
         uncertain_slices: List[ActivitySlice] = []
+        queue_ids: List[int] = []
 
         # 1. Rule engine pass
         for i, s in enumerate(slices):
@@ -48,6 +52,15 @@ class HybridBackend:
                     weight=rule_result.weight,
                     skip_analysis=rule_result.skip_analysis,
                 ))
+            elif rule_result.confidence < self.low_confidence_threshold:
+                # Skip queue for very low confidence: use rule fallback directly
+                results.append(ClassificationResult(
+                    activity_type=rule_result.activity_type,
+                    confidence=rule_result.confidence,
+                    method="rule_low_conf",
+                    weight=rule_result.weight,
+                    skip_analysis=rule_result.skip_analysis,
+                ))
             else:
                 results.append(None)
                 uncertain_indices.append(i)
@@ -57,7 +70,7 @@ class HybridBackend:
         if uncertain_slices and self.storage:
             for s in uncertain_slices:
                 rule_r = self.rules.classify(s.primary_app, s.primary_title, s.web_url)
-                self.storage.enqueue_batch_item(
+                qid = self.storage.enqueue_batch_item(
                     slice_start=s.start.isoformat(),
                     slice_end=s.end.isoformat(),
                     app=s.primary_app,
@@ -65,6 +78,7 @@ class HybridBackend:
                     url=s.web_url,
                     rule_confidence=rule_r.confidence,
                 )
+                queue_ids.append(qid)
 
         # 3. LLM pass for uncertain (if budget allows)
         if uncertain_slices:
@@ -86,11 +100,9 @@ class HybridBackend:
                         output_tokens,
                         "batch_classify",
                     )
-                    # Mark queue items as processed
-                    if self.storage:
-                        pending = self.storage.get_pending_batch(limit=len(uncertain_slices))
-                        if pending:
-                            self.storage.mark_batch_processed([p["id"] for p in pending])
+                    # Mark only the queue items from this batch as processed
+                    if self.storage and queue_ids:
+                        self.storage.mark_batch_processed(queue_ids)
                 except Exception as e:
                     logger.warning(f"LLM batch_classify failed: {e}")
 
