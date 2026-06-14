@@ -33,6 +33,10 @@ def create_classifier(
     rule_engine = RuleEngine.with_all_rules()
 
     if config.ai.backend == "hybrid":
+        if not config.ai.openai.api_key.strip():
+            logger.info("Hybrid backend has no API key; using rule-only classifier.")
+            return RuleOnlyClassifier(rule_engine)
+
         try:
             from aw_coach.ai.cost import CostController
             from aw_coach.ai.hybrid import HybridBackend

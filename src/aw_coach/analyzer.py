@@ -11,8 +11,11 @@ from aw_coach.collector import ActivitySlice
 from aw_coach.config import AnalysisConfig
 from aw_coach.rules.engine import RuleResult
 
-DEEP_WORK_TYPES = {"programming", "writing", "design", "research"}
+DEEP_WORK_TYPES = {"programming", "writing", "design", "research", "terminal"}
 DISTRACTION_TYPES = {"entertainment", "social"}
+# Non-deep-work types that briefly appear between deep-work blocks
+# without resetting the streak (up to this many seconds).
+PENETRATION_TOLERANCE = 180  # 3 minutes
 
 
 @dataclass
@@ -191,11 +194,12 @@ class PatternAnalyzer:
         if not slices:
             return 0.0
 
-        AFK_GAP_TOLERANCE = 120  # seconds - short breaks don't interrupt
+        AFK_GAP_TOLERANCE = 300  # seconds - 5min breaks don't interrupt
 
         deep_seconds = 0.0
         current_type = None
         current_streak_sec = 0.0
+        penetration_sec = 0.0  # Time in tolerated non-deep-work gaps
 
         for s, r in zip(slices, rules):
             if getattr(r, "skip_analysis", False):
@@ -203,6 +207,7 @@ class PatternAnalyzer:
                     deep_seconds += current_streak_sec
                 current_type = None
                 current_streak_sec = 0.0
+                penetration_sec = 0.0
                 continue
 
             if s.is_afk:
@@ -214,6 +219,7 @@ class PatternAnalyzer:
                         deep_seconds += current_streak_sec
                     current_type = None
                     current_streak_sec = 0.0
+                    penetration_sec = 0.0
                     continue
 
             segments = self._analysis_segments(s, r)
@@ -222,25 +228,34 @@ class PatternAnalyzer:
                     deep_seconds += current_streak_sec
                 current_type = None
                 current_streak_sec = 0.0
+                penetration_sec = 0.0
                 continue
 
             for segment in segments:
                 activity_type = self._activity_type(segment, r)
 
                 if activity_type not in DEEP_WORK_TYPES:
+                    # Tolerate brief "unknown" gaps without breaking streak
+                    if activity_type == "unknown" and penetration_sec < PENETRATION_TOLERANCE:
+                        penetration_sec += segment.duration
+                        continue
+
                     if current_streak_sec >= self.deep_work_threshold * 60:
                         deep_seconds += current_streak_sec
                     current_type = None
                     current_streak_sec = 0.0
+                    penetration_sec = 0.0
                     continue
 
                 if activity_type == current_type:
                     current_streak_sec += segment.duration
+                    penetration_sec = 0.0
                 else:
                     if current_streak_sec >= self.deep_work_threshold * 60:
                         deep_seconds += current_streak_sec
                     current_type = activity_type
                     current_streak_sec = segment.duration
+                    penetration_sec = 0.0
 
         if current_streak_sec >= self.deep_work_threshold * 60:
             deep_seconds += current_streak_sec

@@ -7,7 +7,7 @@ import logging
 import shutil
 import sys
 from datetime import date as date_type
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,8 +23,106 @@ import click
 
 from aw_coach import __version__
 from aw_coach.config import DEFAULT_CONFIG_PATH, Config, load_config
+from aw_coach.service_installer import ServiceError, ServiceManager
+from aw_coach.storage import Storage
 
 logger = logging.getLogger(__name__)
+
+
+def _daemon_log_paths(data_dir: Path) -> tuple[Path, Path]:
+    data_path = Path(data_dir)
+    return (
+        data_path / "aw-coach-daemon.log",
+        data_path / "aw-coach-daemon.err.log",
+    )
+
+
+def _service_heartbeat_lines(config: Config) -> list[str]:
+    try:
+        storage = Storage(config.db_path)
+        heartbeat_raw = storage.get_scheduler_state("service_health")
+    except OSError:
+        return ["heartbeat: unavailable"]
+    except Exception:
+        return ["heartbeat: unavailable"]
+
+    if heartbeat_raw is None:
+        return ["heartbeat: missing or unreadable"]
+
+    try:
+        heartbeat = json.loads(heartbeat_raw)
+        if not isinstance(heartbeat, dict):
+            return ["heartbeat: malformed payload"]
+        last_tick = heartbeat.get("last_tick")
+        last_tick_dt = datetime.fromisoformat(last_tick) if isinstance(last_tick, str) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ["heartbeat: malformed payload"]
+
+    if last_tick_dt is None:
+        return ["heartbeat: malformed payload"]
+
+    if last_tick_dt.tzinfo is not None:
+        now = datetime.now(timezone.utc)
+        last_tick_dt = last_tick_dt.astimezone(timezone.utc)
+    else:
+        now = datetime.now()
+
+    age_seconds = (now - last_tick_dt).total_seconds()
+    status = "fresh" if age_seconds <= 180 else "stale"
+    lines = [f"heartbeat: {status} (last tick: {last_tick})"]
+    if heartbeat.get("last_error"):
+        lines.append(f"last error: {heartbeat.get('last_error')}")
+    return lines
+
+
+def _read_log_tail(path: Path, lines: int) -> list[str] | None:
+    if lines <= 0:
+        return []
+
+    from collections import deque
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return [line.rstrip("\n") for line in deque(handle, maxlen=lines)]
+    except OSError:
+        return None
+
+
+def _service_autostart_health_line(config: Config) -> str:
+    try:
+        status = _service_manager().status()
+        heartbeat_lines = _service_heartbeat_lines(config)
+        heartbeat_summary = heartbeat_lines[0] if heartbeat_lines else "heartbeat: unavailable"
+        pids = ", ".join(str(pid) for pid in status.daemon_pids) or "not running"
+        install_state = "installed" if status.installed else "not installed"
+        return (
+            f"service/autostart: {install_state} state={status.state} "
+            f"pids={pids} {heartbeat_summary}"
+        )
+    except ServiceError as exc:
+        return f"service/autostart: unavailable ({exc})"
+
+def _project_root() -> Path:
+    """Return the repository root path."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _service_manager() -> ServiceManager:
+    """Construct a service manager using the active config."""
+    config = load_config()
+    return ServiceManager(project_root=_project_root(), data_dir=Path(config.data_dir))
+
+
+def _configure_console_output(stream=None) -> None:
+    """Avoid UnicodeEncodeError on legacy Windows code pages."""
+    target = stream if stream is not None else sys.stdout
+    encoding = (getattr(target, "encoding", None) or "").lower()
+    if "utf" in encoding:
+        return
+
+    reconfigure = getattr(target, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8", errors="replace")
 
 
 def _parse_date(date_str: str) -> date_type:
@@ -246,6 +344,9 @@ def _get_analysis(target_date: date_type, config: Config):
 @click.pass_context
 def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     """ActivityWatch AI Coach - work pattern analysis tool."""
+    _configure_console_output(sys.stdout)
+    _configure_console_output(sys.stderr)
+
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
@@ -268,6 +369,7 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         click.echo("  report      View daily report")
         click.echo("  doctor      Diagnose system health")
         click.echo("  config      Show or update configuration")
+        click.echo("  service     Manage background service")
         click.echo("  purge       Delete local generated data")
         click.echo("  calibrate   Classify unknown apps interactively")
         click.echo("  rule-test   Test rule engine matching")
@@ -313,6 +415,110 @@ def config_set(key: str, value: str) -> None:
 
     _write_raw_config(path, raw)
     click.echo(f"Updated {path}: {key} = {_toml_value(parsed_value)}")
+
+
+@main.group()
+def service() -> None:
+    """Manage background service integration."""
+
+
+@service.command("install")
+def service_install() -> None:
+    """Install the background scheduled task."""
+    try:
+        _service_manager().install()
+        click.echo("aw-coach service installed.")
+    except ServiceError as e:
+        raise click.ClickException(str(e))
+
+
+@service.command("uninstall")
+def service_uninstall() -> None:
+    """Uninstall the background scheduled task."""
+    try:
+        _service_manager().uninstall()
+        click.echo("aw-coach service uninstalled.")
+    except ServiceError as e:
+        raise click.ClickException(str(e))
+
+
+@service.command("start")
+def service_start() -> None:
+    """Start the background service."""
+    try:
+        _service_manager().start()
+        click.echo("aw-coach service started.")
+    except ServiceError as e:
+        raise click.ClickException(str(e))
+
+
+@service.command("stop")
+def service_stop() -> None:
+    """Stop the background service."""
+    try:
+        _service_manager().stop()
+        click.echo("aw-coach service stopped.")
+    except ServiceError as e:
+        raise click.ClickException(str(e))
+
+
+@service.command("status")
+def service_status() -> None:
+    """Display service installation/status."""
+    config = load_config()
+    try:
+        status = _service_manager().status()
+    except ServiceError as e:
+        raise click.ClickException(str(e))
+
+    if status.installed:
+        click.echo(f"aw-coach service installed: {status.state}")
+    else:
+        click.echo("aw-coach service not installed.")
+
+    if status.daemon_pids:
+        click.echo("daemon pids: " + ", ".join(str(pid) for pid in status.daemon_pids))
+    else:
+        click.echo("daemon pids: not running")
+
+    for line in _service_heartbeat_lines(config):
+        click.echo(line)
+
+    stdout_log, stderr_log = _daemon_log_paths(config.data_dir)
+    click.echo(f"daemon stdout: {stdout_log}")
+    click.echo(f"daemon stderr: {stderr_log}")
+
+
+@service.command("logs")
+@click.option("--lines", default=50, show_default=True, type=int, help="Number of lines to show")
+def service_logs(lines: int) -> None:
+    """Show daemon stdout and stderr tails."""
+    config = load_config()
+    if lines < 0:
+        lines = 0
+
+    stdout_log, stderr_log = _daemon_log_paths(config.data_dir)
+    click.echo(f"==> {stdout_log} (last {lines} lines) ==")
+    if not stdout_log.exists():
+        click.echo("missing log file")
+    else:
+        tail = _read_log_tail(stdout_log, lines)
+        if tail is None:
+            click.echo("unreadable log file")
+        else:
+            for line in tail:
+                click.echo(line)
+
+    click.echo(f"==> {stderr_log} (last {lines} lines) ==")
+    if not stderr_log.exists():
+        click.echo("missing log file")
+    else:
+        tail = _read_log_tail(stderr_log, lines)
+        if tail is None:
+            click.echo("unreadable log file")
+        else:
+            for line in tail:
+                click.echo(line)
 
 
 @main.command()
@@ -391,6 +597,263 @@ def _first_run_historical(config: Config):
     return analyzer.analyze(slices, rules)
 
 
+# ---------------------------------------------------------------------------
+# Semantic state command (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _compute_active_block_minutes(slices, rule_engine):
+    """Roughly compute how many minutes the current activity block has lasted."""
+    if not slices:
+        return 0
+    sorted_slices = sorted(slices, key=lambda s: s.end)
+    latest = sorted_slices[-1]
+    latest_type = rule_engine.classify(
+        latest.primary_app, latest.primary_title, latest.web_url
+    ).activity_type
+
+    total_sec = 0
+    for s in reversed(sorted_slices):
+        s_type = rule_engine.classify(
+            s.primary_app, s.primary_title, s.web_url
+        ).activity_type
+        if s_type == latest_type:
+            total_sec += getattr(s, "duration", 60)
+        else:
+            break
+    return total_sec // 60
+
+
+def _count_switches_in_slices(slices, rule_engine):
+    """Count activity-type switches in the given slices."""
+    if len(slices) < 2:
+        return 0
+    sorted_slices = sorted(slices, key=lambda s: s.end)
+    types = [
+        rule_engine.classify(s.primary_app, s.primary_title, s.web_url).activity_type
+        for s in sorted_slices
+    ]
+    return sum(1 for i in range(len(types) - 1) if types[i] != types[i + 1])
+
+
+def _render_semantic_state(state_obj, chain_result, context_stack=None, screenshot=None) -> None:
+    """Render SemanticWorkState + ChainAnalysisResult to terminal."""
+    mode_emoji = {
+        "coding": "💻",
+        "debugging": "🐛",
+        "testing": "🧪",
+        "researching": "📖",
+        "collaborating": "🤝",
+        "writing": "✍️",
+        "meeting": "🗣️",
+        "chatting": "💬",
+        "browsing": "🌐",
+        "terminal": "⌨️",
+        "deploying": "🚀",
+        "idle": "💤",
+        "unknown": "❓",
+    }
+    risk_emoji = {
+        "focused": "🟢",
+        "normal": "⚪",
+        "fragmented": "🟡",
+        "stuck": "🔴",
+        "distracted": "🔴",
+        "unknown": "⚪",
+    }
+    pattern_emoji = {
+        "deep_coding": "🎯",
+        "debug_cycle": "🐛",
+        "research_loop": "📚",
+        "context_switching": "🔄",
+        "meeting_block": "🗣️",
+        "idle": "💤",
+        "insufficient_data": "❓",
+    }
+
+    mode = state_obj.likely_mode
+    risk = state_obj.risk_level
+    pattern = chain_result.pattern if chain_result else "insufficient_data"
+
+    # Context Stack info
+    cs_primary_mode = None
+    cs_primary_project = None
+    cs_depth = 0
+    if context_stack:
+        cs_primary_mode = context_stack.get("primary_mode")
+        cs_primary_project = context_stack.get("primary_project")
+        cs_depth = context_stack.get("depth", 0)
+    show_cs = bool(cs_primary_mode and cs_depth > 0)
+
+    click.echo("┌──────────────────────────────────────────┐")
+    click.echo("│  🧠 AI Coach — 实时语义状态              │")
+    click.echo("├──────────────────────────────────────────┤")
+    click.echo(f"│  应用:      {state_obj.current_app:<30} │")
+    title = (
+        state_obj.current_title[:28] + "…"
+        if len(state_obj.current_title) > 29
+        else state_obj.current_title
+    )
+    click.echo(f"│  标题:      {title:<30} │")
+    if state_obj.semantic_project:
+        click.echo(f"│  项目:      {state_obj.semantic_project:<30} │")
+    if state_obj.semantic_filename:
+        lang = f" ({state_obj.semantic_language})" if state_obj.semantic_language else ""
+        click.echo(f"│  文件:      {state_obj.semantic_filename}{lang:<28} │")
+    if state_obj.semantic_site:
+        click.echo(f"│  网站:      {state_obj.semantic_site:<30} │")
+    if state_obj.git_repo:
+        dirty = "*" if state_obj.git_is_dirty else ""
+        click.echo(f"│  Git:       {state_obj.git_repo}@{state_obj.git_branch}{dirty:<28} │")
+    if show_cs:
+        click.echo("├──────────────────────────────────────────┤")
+        cs_mode_str = cs_primary_mode or "-"
+        cs_proj_str = cs_primary_project or "-"
+        click.echo(f"│  主上下文:  {cs_mode_str:<28} │")
+        click.echo(f"│  主项目:    {cs_proj_str:<28} │")
+
+    click.echo("├──────────────────────────────────────────┤")
+    click.echo(f"│  工作模式:  {mode_emoji.get(mode, '❓')} {mode:<28} │")
+    click.echo(f"│  风险等级:  {risk_emoji.get(risk, '⚪')} {risk:<28} │")
+    click.echo(f"│  活动模式:  {pattern_emoji.get(pattern, '❓')} {pattern:<28} │")
+    block_text = (
+        f"{state_obj.active_block_minutes} 分钟"
+        if state_obj.active_block_minutes >= 1
+        else "不足 1 分钟"
+    )
+    click.echo(f"│  专注块:    {block_text:<30} │")
+    if state_obj.switches_last_5min:
+        click.echo(f"│  5分钟切换: {state_obj.switches_last_5min} 次{'':<29} │")
+    if screenshot:
+        click.echo("├──────────────────────────────────────────┤")
+        diff_pct = int(screenshot.get("diff_ratio", 0) * 100)
+        ctype = screenshot.get("content_type", "unknown")
+        ctype_label = {
+            "static": "静态内容",
+            "scrolling": "滚动/打字",
+            "video": "视频/动画",
+            "major_change": "大幅变化",
+        }.get(ctype, ctype)
+        click.echo(f"│  屏幕变化:  {diff_pct}% ({ctype_label})")
+        ocr = screenshot.get("ocr_text")
+        if ocr:
+            ocr_preview = ocr[:35] + "…" if len(ocr) > 35 else ocr
+            click.echo(f"│  OCR文本:   {ocr_preview}")
+    click.echo("└──────────────────────────────────────────┘")
+
+    if chain_result and chain_result.insight:
+        click.echo(f"💡 {chain_result.insight}")
+
+    if risk == "fragmented":
+        click.echo("💡 提示: 最近切换频繁，尝试番茄工作法聚焦 25 分钟。")
+    elif risk == "stuck":
+        click.echo("💡 提示: 你似乎卡住了，站起来活动一下或换个思路？")
+    elif risk == "distracted":
+        click.echo("💡 提示: 当前活动偏休闲，注意时间分配。")
+
+
+@main.command()
+def state() -> None:
+    """Show semantic-enriched real-time work state."""
+    from aw_coach.chain_analyzer import ChainAnalysisResult, ChainAnalyzer
+    from aw_coach.collector import DataCollector
+    from aw_coach.enriched_state import EnrichedStateAssembler, SemanticWorkState
+    from aw_coach.rules.engine import RuleEngine
+    from aw_coach.storage import Storage
+
+    config = load_config()
+
+    # 1. Try to read persisted state from scheduler
+    try:
+        storage = Storage(config.db_path)
+        raw = storage.get_scheduler_state("semantic_state")
+        if raw:
+            import json
+
+            data = json.loads(raw)
+            state_dict = data.get("state", {})
+            chain_dict = data.get("chain", {})
+            cs_dict = data.get("context_stack", {})
+            screenshot_dict = data.get("screenshot")
+            # Parse updated_at back to datetime if present
+            if "updated_at" in state_dict and isinstance(state_dict["updated_at"], str):
+                state_dict["updated_at"] = datetime.fromisoformat(state_dict["updated_at"])
+            state_obj = SemanticWorkState(**state_dict)
+            chain_result = ChainAnalysisResult(
+                pattern=chain_dict.get("pattern", "insufficient_data"),
+                depth_score=chain_dict.get("depth_score", 0.0),
+                fragmentation_score=chain_dict.get("fragmentation_score", 0.0),
+                insight=chain_dict.get("insight"),
+                confidence=1.0,
+            )
+            _render_semantic_state(state_obj, chain_result, cs_dict, screenshot_dict)
+            click.echo("\n(数据来自 scheduler 缓存)")
+            return
+    except Exception:
+        pass
+
+    # 2. Fallback: compute live from aw data
+    try:
+        collector = DataCollector()
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Is ActivityWatch running? Try `aw-coach doctor`.", err=True)
+        return
+
+    start = datetime.now() - timedelta(minutes=30)
+    slices = [
+        s for s in collector.fetch_range(start, datetime.now())
+        if not s.is_afk and getattr(s, "duration", 0) >= 3
+    ]
+
+    if not slices:
+        click.echo("暂无活动数据。ActivityWatch 是否正在运行？")
+        return
+
+    # Align timezone with slice timestamps for consistent comparison
+    _tz = getattr(slices[0].end, "tzinfo", None)
+    now = datetime.now(_tz) if _tz else datetime.now()
+
+    engine = RuleEngine.with_all_rules()
+    latest = max(slices, key=lambda s: s.end)
+    rule = engine.classify(latest.primary_app, latest.primary_title, latest.web_url)
+
+    block_minutes = _compute_active_block_minutes(slices, engine)
+
+    recent_start = now - timedelta(minutes=5)
+    recent_slices = [s for s in slices if s.end >= recent_start]
+    switches_5m = _count_switches_in_slices(recent_slices, engine)
+
+    assembler = EnrichedStateAssembler()
+    state_obj = assembler.assemble(
+        app=latest.primary_app,
+        title=latest.primary_title,
+        url=getattr(latest, "web_url", None),
+        active_block_minutes=block_minutes,
+        rule_activity=rule.activity_type,
+        switches_last_5min=switches_5m,
+    )
+
+    # Build a tiny chain for analysis (last up to 10 slices)
+    chain_records = []
+    for s in sorted(slices, key=lambda s: s.end)[-10:]:
+        s_rule = engine.classify(s.primary_app, s.primary_title, s.web_url)
+        chain_records.append(
+            assembler.assemble(
+                app=s.primary_app,
+                title=s.primary_title,
+                url=getattr(s, "web_url", None),
+                active_block_minutes=getattr(s, "duration", 60) // 60,
+                rule_activity=s_rule.activity_type,
+            )
+        )
+
+    chain_analyzer = ChainAnalyzer()
+    chain_result = chain_analyzer.analyze(chain_records)
+
+    _render_semantic_state(state_obj, chain_result)
+
+
 @main.command()
 @click.option("--full", is_flag=True, help="Full report with AI suggestions")
 @click.option("--dry-run", is_flag=True, help="Show LLM prompt without calling API")
@@ -415,8 +878,37 @@ def report(full: bool, dry_run: bool, date: str) -> None:
     # Decide whether AI suggestions are requested.
     use_ai = full and not dry_run and config.ai.backend != "rule_only"
 
+    # Phase 1: compute semantic project breakdown
+    project_breakdown = None
+    try:
+        from collections import defaultdict
+
+        from aw_coach.collector import DataCollector
+        from aw_coach.context_parser import TitleParser
+
+        collector = DataCollector()
+        start = datetime.combine(target, datetime.min.time())
+        end = datetime.combine(target, datetime.max.time())
+        if target == date_type.today():
+            end = datetime.now()
+        slices = collector.fetch_range(start, end)
+        parser = TitleParser()
+        proj_dur = defaultdict(float)
+        for s in slices:
+            if s.is_afk:
+                continue
+            ctx = parser.parse(s.primary_app, s.primary_title, s.web_url)
+            if ctx.project:
+                proj_dur[ctx.project] += s.duration / 3600
+        if proj_dur:
+            project_breakdown = dict(proj_dur)
+    except Exception:
+        pass
+
     reporter = ReportGenerator(config)
-    report_text = reporter.generate_daily(target, analysis, use_ai=use_ai)
+    report_text = reporter.generate_daily(
+        target, analysis, use_ai=use_ai, project_breakdown=project_breakdown
+    )
 
     if dry_run and config.ai.backend != "rule_only":
         from aw_coach.ai.suggestions import _build_prompt
@@ -558,6 +1050,8 @@ def doctor(run_calibrate: bool) -> None:
         )
     else:
         click.echo(click.style("✅ platform", fg="green") + f"    {system}")
+
+    click.echo(_service_autostart_health_line(config))
 
     # 5. AI backend + cost
     click.echo(click.style("ℹ️  ai backend", fg="blue") + f"  {config.ai.backend}")

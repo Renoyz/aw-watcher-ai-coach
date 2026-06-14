@@ -1,15 +1,16 @@
 """Tests for CLI entry point."""
 
+import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import yaml
 from click.testing import CliRunner
 
-from aw_coach.cli import main
+from aw_coach.cli import _configure_console_output, main
 from aw_coach.collector import ActivitySlice, DataCollector
 from aw_coach.config import Config, load_config
 from aw_coach.storage import Storage
@@ -28,9 +29,546 @@ def test_no_subcommand_shows_help():
     assert result.exit_code == 0
     assert "aw-coach" in result.output
     assert "status" in result.output
+    assert "service" in result.output
     assert "report" in result.output
     assert "doctor" in result.output
     assert "rule-test" in result.output
+
+
+def test_configure_console_output_tolerates_gbk_stdout():
+    stream = Mock()
+    stream.encoding = "cp936"
+    stream.errors = "strict"
+
+    _configure_console_output(stream)
+
+    stream.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
+
+def test_service_status_command_reports_installed(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Ready")
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "installed" in result.output.lower()
+    assert "Ready" in result.output
+
+
+def test_service_status_command_reports_daemon_details_and_heartbeat(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    fresh_tick = (datetime.now() - timedelta(seconds=60)).isoformat()
+    log_root = tmp_path
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(
+                installed=True,
+                state="Running",
+                daemon_pids=(1234, 5678),
+            )
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            if key != "service_health":
+                return None
+            return json.dumps(
+                {
+                    "last_tick": fresh_tick,
+                    "last_error": "temporary issue",
+                }
+            )
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=log_root, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "installed" in result.output.lower()
+    assert "running" in result.output.lower()
+    assert "1234" in result.output
+    assert "5678" in result.output
+    assert "heartbeat" in result.output.lower()
+    assert "fresh" in result.output.lower()
+    assert "last tick" in result.output.lower()
+    assert "aw-coach-daemon.log" in result.output
+    assert "aw-coach-daemon.err.log" in result.output
+    assert "temporary issue" in result.output
+
+
+def test_service_status_command_handles_invalid_heartbeat_payload(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Running")
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            return "not-json" if key == "service_health" else None
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "not installed" not in result.output.lower()
+    assert "heartbeat" in result.output.lower()
+    assert "malformed payload" in result.output.lower()
+
+
+def test_service_status_command_handles_non_object_heartbeat_payload(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Running")
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            return "[]" if key == "service_health" else None
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "heartbeat: malformed payload" in result.output.lower()
+
+
+def test_service_status_command_with_unreadable_heartbeat_reports_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Running")
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            if key != "service_health":
+                return None
+            raise OSError("db locked")
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "heartbeat: unavailable" in result.output.lower()
+    assert "malformed payload" not in result.output.lower()
+
+
+def test_service_logs_command_prints_log_tails(monkeypatch, tmp_path):
+    (tmp_path / "aw-coach-daemon.log").write_text(
+        "stdout-1\nstdout-2\nstdout-3\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "aw-coach-daemon.err.log").write_text(
+        "stderr-1\nstderr-2\nstderr-3\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "logs", "--lines", "2"])
+
+    assert result.exit_code == 0
+    assert "aw-coach-daemon.log" in result.output
+    assert "aw-coach-daemon.err.log" in result.output
+    assert "stdout-2" in result.output
+    assert "stdout-3" in result.output
+    assert "stderr-2" in result.output
+    assert "stderr-3" in result.output
+    assert "stdout-1" not in result.output
+    assert "stderr-1" not in result.output
+
+
+def test_service_logs_command_reports_missing_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "logs", "--lines", "2"])
+
+    assert result.exit_code == 0
+    assert "missing log file" in result.output.lower()
+
+
+def test_service_logs_command_reports_unreadable_files(monkeypatch, tmp_path):
+    (tmp_path / "aw-coach-daemon.log").mkdir()
+    (tmp_path / "aw-coach-daemon.err.log").write_text("stderr-ok\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: SimpleNamespace(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "logs", "--lines", "2"])
+
+    assert result.exit_code == 0
+    assert "unreadable log file" in result.output.lower()
+    assert "stderr-ok" in result.output
+
+
+def test_service_status_command_keeps_runtime_info_when_not_installed(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    fresh_tick = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(
+                installed=False,
+                state="NotInstalled",
+                daemon_pids=(1234,),
+            )
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            if key != "service_health":
+                return None
+            return json.dumps({"last_tick": fresh_tick})
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "not installed" in result.output.lower()
+    assert "daemon pids: 1234" in result.output.lower()
+    assert "heartbeat: fresh" in result.output.lower()
+    assert "aw-coach-daemon.log" in result.output
+    assert "aw-coach-daemon.err.log" in result.output
+
+
+def test_service_status_command_handles_aware_heartbeat_timestamp(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    fresh_tick = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Running")
+
+    class FakeStorage:
+        def __init__(self, *_):
+            pass
+
+        def get_scheduler_state(self, key):
+            if key != "service_health":
+                return None
+            return json.dumps({"last_tick": fresh_tick})
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "heartbeat: fresh" in result.output.lower()
+    assert "malformed payload" not in result.output.lower()
+
+
+def test_doctor_reports_service_autostart_status(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            pass
+
+        def status(self):
+            return ServiceStatus(installed=True, state="Ready", daemon_pids=(101, 202))
+
+    class FakeStorage:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_scheduler_state(self, key):
+            if key == "service_health":
+                return json.dumps(
+                    {
+                        "last_tick": datetime.now(timezone.utc).isoformat(),
+                        "status": "running",
+                    }
+                )
+            return None
+
+    class FakeRuleEngine:
+        @classmethod
+        def with_builtin_rules(cls):
+            return cls(rules=())
+
+        def __init__(self, rules):
+            self.rules = rules
+
+    class FakeCollector:
+        hostname = "test-host"
+
+        def __init__(self, *args, **kwargs):
+            self.client = SimpleNamespace(get_buckets=lambda: {})
+
+    def fake_build_corrections(storage, engine):
+        return []
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr("aw_coach.rules.engine.RuleEngine", FakeRuleEngine)
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+    monkeypatch.setattr("aw_coach.collector.DataCollector", FakeCollector)
+    monkeypatch.setattr(
+        "aw_coach.correction.build_pending_rule_suggestions",
+        fake_build_corrections,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "service/autostart" in result.output.lower()
+    assert "installed" in result.output.lower()
+    assert "pids=101, 202" in result.output.lower()
+    assert "heartbeat:" in result.output.lower()
+
+
+def test_doctor_service_status_errors_do_not_fail(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceError
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            pass
+
+        def status(self):
+            raise ServiceError("service unavailable")
+
+    class FakeCollector:
+        hostname = "test-host"
+
+        def __init__(self, *args, **kwargs):
+            self.client = SimpleNamespace(get_buckets=lambda: {})
+
+    class FakeRuleEngine:
+        @classmethod
+        def with_builtin_rules(cls):
+            return cls(rules=())
+
+        def __init__(self, rules):
+            self.rules = rules
+
+    def fake_build_corrections(storage, engine):
+        return []
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr(
+        "aw_coach.cli.load_config",
+        lambda: Config(data_dir=tmp_path, db_path=tmp_path / "coach.db"),
+    )
+    class FakeStorage:
+        def get_correction_counts(self):
+            return {}
+
+    monkeypatch.setattr("aw_coach.rules.engine.RuleEngine", FakeRuleEngine)
+    monkeypatch.setattr("aw_coach.cli.Storage", lambda *_args, **_kwargs: FakeStorage())
+    monkeypatch.setattr("aw_coach.collector.DataCollector", FakeCollector)
+    monkeypatch.setattr(
+        "aw_coach.correction.build_pending_rule_suggestions",
+        fake_build_corrections,
+    )
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "service/autostart: unavailable" in result.output.lower()
+
+
+def test_service_install_command_calls_manager(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            calls.append(("init", project_root, data_dir))
+
+        def install(self):
+            calls.append(("install",))
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.load_config", lambda: Config(data_dir=tmp_path))
+
+    result = CliRunner().invoke(main, ["service", "install"])
+
+    assert result.exit_code == 0
+    assert calls[-1] == ("install",)
+    assert "installed" in result.output.lower()
+
+
+def test_service_command_reports_service_errors(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceUnsupportedError
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            pass
+
+        def start(self):
+            raise ServiceUnsupportedError("Windows Task Scheduler only")
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.load_config", lambda: Config(data_dir=tmp_path))
+
+    result = CliRunner().invoke(main, ["service", "start"])
+
+    assert result.exit_code != 0
+    assert "Windows Task Scheduler only" in result.output
+
+
+def test_service_status_command_reports_not_installed(monkeypatch, tmp_path):
+    from aw_coach.service_installer import ServiceStatus
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            self.project_root = project_root
+            self.data_dir = data_dir
+
+        def status(self):
+            return ServiceStatus(installed=False, state="NotInstalled")
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.load_config", lambda: Config(data_dir=tmp_path))
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "not installed" in result.output.lower()
+
+
+def test_service_stop_command_calls_manager(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            calls.append(("init", project_root, data_dir))
+
+        def stop(self):
+            calls.append(("stop",))
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.load_config", lambda: Config(data_dir=tmp_path))
+
+    result = CliRunner().invoke(main, ["service", "stop"])
+
+    assert result.exit_code == 0
+    assert calls[-1] == ("stop",)
+    assert "stopped" in result.output.lower()
+
+
+def test_service_uninstall_command_calls_manager(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeServiceManager:
+        def __init__(self, project_root, data_dir):
+            calls.append(("init", project_root, data_dir))
+
+        def uninstall(self):
+            calls.append(("uninstall",))
+
+    monkeypatch.setattr("aw_coach.cli.ServiceManager", FakeServiceManager)
+    monkeypatch.setattr("aw_coach.cli.load_config", lambda: Config(data_dir=tmp_path))
+
+    result = CliRunner().invoke(main, ["service", "uninstall"])
+
+    assert result.exit_code == 0
+    assert calls[-1] == ("uninstall",)
+    assert "uninstalled" in result.output.lower()
 
 
 def test_rule_test_command():
@@ -94,7 +632,8 @@ def test_config_show_command():
         result = runner.invoke(main, ["config", "show"])
 
     assert result.exit_code == 0
-    assert '"backend": "rule_only"' in result.output
+    assert '"backend": "hybrid"' in result.output
+    assert '"enabled": true' in result.output
 
 
 def test_config_set_writes_values(monkeypatch, tmp_path):

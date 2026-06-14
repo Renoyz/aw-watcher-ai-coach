@@ -65,8 +65,8 @@
 
 ```
 +----------------------------------+
-| State Model 实时状态层            | ❌ 缺失
-| UserWorkState + 滚动窗口         |
+| State Model 实时状态层            | 🟡 部分落地
+| enriched_state + context_stack    |
 +----------------------------------+
 +----------------------------------+
 | Detector 事件检测层               | 🟡 仅 death_loop

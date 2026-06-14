@@ -82,6 +82,18 @@ class Storage:
                 PRAGMA user_version = 3;
             """)
 
+        if version < 4:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS state_snapshots (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                    state_json TEXT NOT NULL,
+                    change_reason TEXT NOT NULL DEFAULT 'first_run'
+                );
+                CREATE INDEX IF NOT EXISTS idx_state_time ON state_snapshots(timestamp);
+                PRAGMA user_version = 4;
+            """)
+
         self._conn.commit()
 
     # === Cost Log ===
@@ -245,6 +257,50 @@ class Storage:
             (key, value),
         )
         self._conn.commit()
+
+    # === State Snapshots (change-only) ===
+
+    def save_state_snapshot(self, state_json: str, change_reason: str) -> None:
+        self._conn.execute(
+            "INSERT INTO state_snapshots (timestamp, state_json, change_reason) VALUES (?, ?, ?)",
+            (datetime.now().isoformat(timespec="seconds"), state_json, change_reason),
+        )
+        self._conn.commit()
+
+    def get_last_state_snapshot(self) -> Optional[Dict]:
+        row = self._conn.execute(
+            "SELECT state_json, change_reason, timestamp FROM state_snapshots "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "state_json": row["state_json"],
+            "change_reason": row["change_reason"],
+            "timestamp": row["timestamp"],
+        }
+
+    def get_state_snapshots(self, since: Optional[str] = None, limit: int = 1000) -> List[Dict]:
+        if since:
+            rows = self._conn.execute(
+                "SELECT timestamp, state_json, change_reason FROM state_snapshots "
+                "WHERE datetime(timestamp) >= datetime(?) ORDER BY timestamp DESC LIMIT ?",
+                (since, limit),
+            )
+        else:
+            rows = self._conn.execute(
+                "SELECT timestamp, state_json, change_reason FROM state_snapshots "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            )
+        return [
+            {
+                "timestamp": r["timestamp"],
+                "state_json": r["state_json"],
+                "change_reason": r["change_reason"],
+            }
+            for r in rows
+        ]
 
     def close(self) -> None:
         self._conn.close()

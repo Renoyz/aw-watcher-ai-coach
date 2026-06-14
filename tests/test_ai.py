@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -10,8 +10,9 @@ from aw_coach.ai.base import AIBackend, ClassificationResult
 from aw_coach.ai.cost import CostController
 from aw_coach.ai.hybrid import HybridBackend
 from aw_coach.ai.openai_backend import OpenAIBackend
+from aw_coach.classifier import RuleOnlyClassifier, create_classifier
 from aw_coach.collector import ActivitySlice
-from aw_coach.config import CostConfig
+from aw_coach.config import Config, CostConfig
 from aw_coach.rules.engine import RuleEngine
 from aw_coach.storage import Storage
 
@@ -98,6 +99,21 @@ class TestOpenAIBackend:
 
 
 class TestHybridBackend:
+    def test_default_hybrid_without_api_key_falls_back_to_rules(self):
+        config = Config()
+
+        with patch("aw_coach.storage.Storage") as storage_cls, patch(
+            "aw_coach.ai.openai_backend.OpenAIBackend"
+        ) as openai_cls:
+            classifier = create_classifier(config)
+
+        assert isinstance(classifier, RuleOnlyClassifier)
+        storage_cls.assert_not_called()
+        openai_cls.assert_not_called()
+
+        results = classifier.batch_classify([_slice("Code", "main.py")])
+        assert results[0].activity_type == "programming"
+
     def test_all_confident_skips_llm(self, storage):
         """When all slices are confidently classified by rules, LLM is not called."""
         rule_engine = RuleEngine.with_builtin_rules()
