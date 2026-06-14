@@ -1,5 +1,7 @@
 # ActivityWatch AI Coach
 
+**Language:** English | [简体中文](README.zh-CN.md)
+
 ActivityWatch AI Coach analyzes local ActivityWatch data and turns it into work-pattern summaries, reports, and lightweight coaching diagnostics.
 
 The project is currently optimized for local-first Windows use with ActivityWatch already running.
