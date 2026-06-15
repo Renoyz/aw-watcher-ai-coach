@@ -264,7 +264,8 @@ class TestScreenshotConfig:
         assert "same_title" in reason
 
     def test_no_double_capture(self):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
+
         from aw_coach.enriched_state import SemanticWorkState
 
         state = SemanticWorkState(

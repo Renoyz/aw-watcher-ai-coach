@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
-from aw_coach.state import AgentState, CoachAgentStateMachine, StateMachineSnapshot
+from aw_coach.state import AgentState, CoachAgentStateMachine
 
 
 class TestStateTransitions:

@@ -82,7 +82,10 @@ class AICodingLoopDetector(Detector):
                 signal_type="ai_loop",
                 severity=0.6,
                 confidence=0.75,
-                evidence=f"AI↔code alternation: {transitions} transitions, {ai_minutes} min AI time",
+                evidence=(
+                    f"AI↔code alternation: {transitions} transitions, "
+                    f"{ai_minutes} min AI time"
+                ),
                 suggested_action="inbox",
             )
 

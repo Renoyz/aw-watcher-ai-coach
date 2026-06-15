@@ -11,10 +11,10 @@ Prevents notification spam by tracking whether the agent is:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Dict, Optional
+from typing import Optional
 
 
 class AgentState(Enum):
@@ -62,7 +62,7 @@ class CoachAgentStateMachine:
         self.last_signal_type: Optional[str] = None
         self.last_action: Optional[str] = None
         self.notifications_today: int = 0
-        self.notify_date: Optional[date] = None  # type: ignore[name-defined]
+        self.notify_date: Optional[date] = None
         self.cooldown_until: Optional[datetime] = None
         self.feedback_timeout_until: Optional[datetime] = None
 
@@ -137,7 +137,7 @@ class CoachAgentStateMachine:
         return True
 
     def may_inbox(self, signal_type: Optional[str] = None) -> bool:
-        """Inbox queuing is more permissive than notify, but still blocked during acting/feedback."""
+        """Return True if the agent may queue an inbox item."""
         self.auto_advance()
         if self.state in (AgentState.AWAITING_FEEDBACK, AgentState.ACTING):
             return False

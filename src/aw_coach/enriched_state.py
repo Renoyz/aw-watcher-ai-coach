@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from aw_coach.context_parser import TitleParser, WindowContext
-from aw_coach.detectors import CompositeDetector
+from aw_coach.detectors import AgentSignal, CompositeDetector
 from aw_coach.git_context import GitContext, get_git_context_for_project
 
 # --- App category lists for mode inference ---
@@ -318,7 +318,7 @@ class SemanticWorkState:
     likely_mode: str = "unknown"
     risk_level: str = "unknown"
     detected_signal: Optional[str] = None  # e.g. focused, search_loop, ai_loop
-    agent_signal: Optional["AgentSignal"] = None  # structured signal from detectors
+    agent_signal: Optional[AgentSignal] = None  # structured signal from detectors
     active_block_minutes: int = 0
 
     # === Task perception (optional) ===
@@ -388,7 +388,11 @@ class SemanticWorkState:
         if self.terminal_command:
             display["终端命令"] = self.terminal_command
         if self.screen_ocr_text:
-            ocr_preview = self.screen_ocr_text[:60] + "..." if len(self.screen_ocr_text) > 60 else self.screen_ocr_text
+            ocr_preview = (
+                self.screen_ocr_text[:60] + "..."
+                if len(self.screen_ocr_text) > 60
+                else self.screen_ocr_text
+            )
             display["OCR预览"] = ocr_preview
         if self.screen_content_type:
             display["屏幕类型"] = self.screen_content_type

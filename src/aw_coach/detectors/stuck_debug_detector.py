@@ -41,7 +41,10 @@ class StuckDebugDetector(Detector):
                 signal_type="stuck",
                 severity=0.7,
                 confidence=0.85,
-                evidence=f"Debug/build loop detected: {unique_modes} modes over {self.MIN_HISTORY} checks",
+                evidence=(
+                    f"Debug/build loop detected: {unique_modes} modes over "
+                    f"{self.MIN_HISTORY} checks"
+                ),
                 suggested_action="notify_now",
             )
 

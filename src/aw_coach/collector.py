@@ -227,9 +227,14 @@ def _enrich_slice_from_url(s: ActivitySlice) -> None:
         s.site_type = "pr"
     elif "/blob/" in path or "/tree/" in path or "/commit/" in path:
         s.site_type = "repo"
-    elif any(d in netloc for d in ("stackoverflow", "docs.", "readthedocs", "python.org", "developer.mozilla.org")):
+    elif any(
+        d in netloc
+        for d in ("stackoverflow", "docs.", "readthedocs", "python.org", "developer.mozilla.org")
+    ):
         s.site_type = "docs"
-    elif "/search" in path or any(d in netloc for d in ("google.com", "bing.com", "duckduckgo.com")):
+    elif "/search" in path or any(
+        d in netloc for d in ("google.com", "bing.com", "duckduckgo.com")
+    ):
         s.site_type = "search"
     elif any(d in netloc for d in ("youtube.com", "bilibili.com", "vimeo.com")):
         s.site_type = "video"

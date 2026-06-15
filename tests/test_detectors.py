@@ -152,9 +152,21 @@ class TestAICodingLoopDetector:
         state = _make_state(mode="coding", app="Code")
         history = [
             _make_state(mode="coding", app="Code", block_min=15),
-            _make_state(mode="chatting", app="firefox", title="ChatGPT", semantic_site="chatgpt", block_min=15),
+            _make_state(
+                mode="chatting",
+                app="firefox",
+                title="ChatGPT",
+                semantic_site="chatgpt",
+                block_min=15,
+            ),
             _make_state(mode="coding", app="Code", block_min=15),
-            _make_state(mode="chatting", app="firefox", title="ChatGPT", semantic_site="chatgpt", block_min=15),
+            _make_state(
+                mode="chatting",
+                app="firefox",
+                title="ChatGPT",
+                semantic_site="chatgpt",
+                block_min=15,
+            ),
         ]
         result = det.detect(state, history)
         assert result is not None
@@ -166,9 +178,21 @@ class TestAICodingLoopDetector:
         state = _make_state(mode="coding", app="Code")
         history = [
             _make_state(mode="coding", app="Code", block_min=15),
-            _make_state(mode="browsing", app="firefox", title="ChatGPT", semantic_site="chatgpt", block_min=15),
+            _make_state(
+                mode="browsing",
+                app="firefox",
+                title="ChatGPT",
+                semantic_site="chatgpt",
+                block_min=15,
+            ),
             _make_state(mode="coding", app="Code", block_min=15),
-            _make_state(mode="browsing", app="firefox", title="ChatGPT", semantic_site="chatgpt", block_min=15),
+            _make_state(
+                mode="browsing",
+                app="firefox",
+                title="ChatGPT",
+                semantic_site="chatgpt",
+                block_min=15,
+            ),
         ]
         assert det.detect(state, history) is None
 

@@ -46,7 +46,10 @@ class SearchLoopDetector(Detector):
                     signal_type="search_loop",
                     severity=0.6,
                     confidence=0.8,
-                    evidence=f"Research↔code oscillation: {oscillations} transitions in recent history",
+                    evidence=(
+                        f"Research↔code oscillation: {oscillations} transitions "
+                        "in recent history"
+                    ),
                     suggested_action="inbox",
                 )
 

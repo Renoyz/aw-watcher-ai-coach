@@ -265,8 +265,8 @@ class ScreenshotTrigger:
         self.blocklist_apps: Set[str] = set(
             (a.lower() for a in (blocklist_apps or []))
         )
-        self._history: List[Tuple[datetime, str, str]] = []  # (time, app, title) – capture history
-        self._state_history: List[Tuple[datetime, str, str]] = []  # (time, app, title) – per-minute state history
+        self._history: List[Tuple[datetime, str, str]] = []
+        self._state_history: List[Tuple[datetime, str, str]] = []
         self._last_capture_at: Optional[datetime] = None
 
     def should_capture(
