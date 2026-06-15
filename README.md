@@ -1,38 +1,94 @@
-# aw-watcher-ai-coach
+# ActivityWatch AI Coach
 
-ActivityWatch 的本地优先 AI 工作教练：规则 + 可选 LLM 分类、模式分析、主动检测、后台摘要与任务感知。
+**Language:** English | [简体中文](README.zh-CN.md)
 
-## 安装
+ActivityWatch AI Coach is a local-first work coach for ActivityWatch data. It combines
+rules, optional LLM classification, pattern analysis, proactive assistance, background
+summaries, and task perception.
+
+## What It Does
+
+- Reads local ActivityWatch window, AFK, and optional browser events.
+- Classifies work activity with rule-only, hybrid, or OpenAI-compatible backends.
+- Generates status, daily, and weekly reports.
+- Runs an optional background daemon and web dashboard.
+- Tracks semantic context, process context, Git context, task signals, and optional screenshots.
+- Provides proactive assistance through an inbox and policy gate.
+- Supports Windows autostart diagnostics for Task Scheduler and Run key setups.
+
+## Requirements
+
+- Python 3.9 or newer.
+- ActivityWatch running locally.
+- Optional: an OpenAI-compatible API key for hybrid or LLM-backed features.
+- Optional on Windows: Git and PowerShell for service/autostart workflows.
+
+## Install For Development
 
 ```bash
-pip install -e ".[ai,dev]"
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,ai,screenshot,web]"
 ```
 
-确保 ActivityWatch（`aw-server` + `aw-watcher-window` + `aw-watcher-afk`）已运行。
+On Windows PowerShell:
 
-## 快速开始
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,ai,screenshot,web]"
+```
+
+## Quick Start
 
 ```bash
-aw-coach doctor          # 环境诊断
-aw-coach status          # 今日概览
-aw-coach state           # 实时语义状态（需 daemon）
-aw-coach report          # 日报
-aw-coach report --full   # 含 AI 建议
-aw-coach inbox list      # 查看主动辅助消息
-aw-coach task list       # 今日任务分布
+aw-coach doctor
+aw-coach status
+aw-coach state
+aw-coach report
+aw-coach report --full
+aw-coach inbox list
+aw-coach task list
+aw-coach serve
 ```
 
-## 后台服务
+If `aw-coach` is not on `PATH`, run with `PYTHONPATH=src`:
 
 ```bash
-aw-coach-daemon          # Web 仪表盘 + 定时分析
-# 或
-systemctl --user start aw-coach   # 见 contrib/aw-coach.service
+PYTHONPATH=src python -m aw_coach.cli doctor
 ```
 
-## 配置
+## Background Service
 
-`~/.config/activitywatch/aw-watcher-ai-coach.toml`
+Run the daemon directly:
+
+```bash
+aw-coach-daemon
+```
+
+On Windows, install and inspect autostart:
+
+```powershell
+aw-coach service install
+aw-coach service start
+aw-coach service status
+aw-coach service logs --lines 50
+```
+
+The Windows installer first tries Task Scheduler. If normal user permissions cannot
+register the task, it falls back to the current-user Run key.
+
+## Configuration
+
+Default path:
+
+```text
+~/.config/activitywatch/aw-watcher-ai-coach.toml
+```
+
+Example:
 
 ```toml
 [ai]
@@ -50,7 +106,7 @@ quiet_hours_end = "08:00"
 
 [report]
 instant_summary_interval_hours = 2
-background_ai_summary = false   # 灰度开启后台 LLM 叙事摘要
+background_ai_summary = false
 morning_brief_time = "09:00"
 
 [tasks]
@@ -58,17 +114,41 @@ enabled = true
 project_roots = ["~/projects", "~/下载/activitywatch"]
 
 [screenshot]
-enabled = false    # 默认关闭，保护隐私
+enabled = false
 ```
 
-## CLI 速查
+## CLI Reference
 
-| 命令 | 说明 |
-|------|------|
-| `aw-coach inbox list/dismiss/accept` | 主动辅助收件箱 |
-| `aw-coach task list/confirm/set/review` | 任务感知与校准 |
-| `aw-coach serve` | 交互式 Web 仪表盘 |
-| `aw-coach cost` | LLM 成本统计 |
-| `aw-coach config show/set/path` | 配置管理 |
+| Command | Purpose |
+| --- | --- |
+| `aw-coach inbox list/dismiss/accept` | Proactive assistance inbox |
+| `aw-coach task list/confirm/set/review` | Task perception and calibration |
+| `aw-coach serve` | Interactive web dashboard |
+| `aw-coach cost` | LLM cost statistics |
+| `aw-coach config show/set/path` | Configuration management |
+| `aw-coach service status/logs` | Windows service diagnostics |
 
-详见 `AGENT.md` 与设计文档 `doc/`。
+## Privacy Notes
+
+This tool is local-first, but it can still process sensitive local activity metadata.
+
+- ActivityWatch event data stays in your local ActivityWatch database.
+- AI calls are controlled by the configured backend.
+- Screenshot analysis is optional and disabled by default.
+- Built-in rules can mark sensitive contexts as `skip_screenshot`.
+- Do not commit local databases, reports, screenshots, logs, or secrets.
+
+## Development Checks
+
+```bash
+python -m ruff check .
+PYTHONPATH=src python -m pytest tests/ -p no:anyio -q
+```
+
+## GitHub Workflow
+
+- `main` is the stable default branch.
+- Feature work should happen on topic branches.
+- Use draft pull requests for large changes.
+
+See `AGENT.md` and the design documents in `doc/` for deeper implementation notes.
