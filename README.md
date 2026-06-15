@@ -117,6 +117,10 @@ project_roots = ["~/projects", "~/下载/activitywatch"]
 enabled = false
 ```
 
+With the default `hybrid` backend, the classifier stays local-only until
+`ai.openai.api_key` is configured. Without an API key it falls back to rule-only
+classification instead of making external calls.
+
 ## CLI Reference
 
 | Command | Purpose |

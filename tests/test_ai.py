@@ -98,6 +98,28 @@ class TestOpenAIBackend:
 
 
 class TestHybridBackend:
+    def test_default_hybrid_without_api_key_falls_back_to_rules(self):
+        """Default hybrid config must stay local-only until an API key is configured."""
+        from aw_coach.classifier import RuleOnlyClassifier, create_classifier
+        from aw_coach.config import Config
+
+        fallbacks = []
+        classifier = create_classifier(Config(), on_hybrid_fallback=fallbacks.append)
+
+        assert isinstance(classifier, RuleOnlyClassifier)
+        assert len(fallbacks) == 1
+        assert "api_key" in str(fallbacks[0])
+
+    def test_openai_without_api_key_still_errors(self):
+        """Pure OpenAI mode is explicit and should not silently fall back."""
+        from aw_coach.classifier import create_classifier
+        from aw_coach.config import AIConfig, Config
+
+        config = Config(ai=AIConfig(backend="openai"))
+
+        with pytest.raises(ValueError, match="requires ai.openai.api_key"):
+            create_classifier(config)
+
     def test_all_confident_skips_llm(self, storage):
         """When all slices are confidently classified by rules, LLM is not called."""
         rule_engine = RuleEngine.with_builtin_rules()

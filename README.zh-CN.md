@@ -114,6 +114,8 @@ project_roots = ["~/projects", "~/下载/activitywatch"]
 enabled = false    # 默认关闭，保护隐私
 ```
 
+默认 `hybrid` 后端在未配置 `ai.openai.api_key` 时仍保持本地优先：不会发起外部 AI 调用，而是回退到纯规则分类。
+
 ## CLI 速查
 
 | 命令 | 说明 |

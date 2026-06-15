@@ -44,6 +44,16 @@ def create_classifier(
     """Create the configured classifier, falling back to rules if hybrid cannot start."""
     rule_engine = RuleEngine.with_all_rules()
 
+    def fallback_to_rules(reason: Exception) -> RuleOnlyClassifier:
+        if on_hybrid_fallback is not None:
+            on_hybrid_fallback(reason)
+        else:
+            logger.warning(
+                "Failed to initialize hybrid backend; falling back to rule_only: %s",
+                reason,
+            )
+        return RuleOnlyClassifier(rule_engine)
+
     if config.ai.backend == "openai":
         if not config.ai.openai.api_key:
             raise ValueError(
@@ -60,6 +70,13 @@ def create_classifier(
         return LLMOnlyClassifier(llm)
 
     if config.ai.backend == "hybrid":
+        if not config.ai.openai.api_key:
+            return fallback_to_rules(
+                ValueError(
+                    "ai.backend=hybrid has no ai.openai.api_key; "
+                    "using rule_only fallback"
+                )
+            )
         try:
             from aw_coach.ai.cost import CostController
             from aw_coach.ai.hybrid import HybridBackend
@@ -75,13 +92,7 @@ def create_classifier(
             cost = CostController(config.cost, storage)
             return HybridBackend(rule_engine, llm, cost, storage=storage)
         except Exception as e:
-            if on_hybrid_fallback is not None:
-                on_hybrid_fallback(e)
-            else:
-                logger.warning(
-                    "Failed to initialize hybrid backend; falling back to rule_only.",
-                    exc_info=True,
-                )
+            return fallback_to_rules(e)
 
     return RuleOnlyClassifier(rule_engine)
 
