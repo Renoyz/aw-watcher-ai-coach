@@ -50,26 +50,26 @@ class TestEffectiveHours:
 
 
 class TestDeepWork:
-    def test_25min_continuous_counts(self, analyzer):
-        """25+ minutes of same type counts as deep work."""
+    def test_15min_continuous_counts(self, analyzer):
+        """15+ minutes of same type counts as deep work."""
         slices = [_slice(9, 0, 30)]
         rules = [_rule("programming")]
         result = analyzer.analyze(slices, rules)
         assert result.deep_work_hours >= 30 / 60
 
     def test_short_session_not_deep(self, analyzer):
-        """Less than 25 minutes does not count as deep work."""
-        slices = [_slice(9, 0, 20)]
+        """Less than 15 minutes does not count as deep work."""
+        slices = [_slice(9, 0, 10)]
         rules = [_rule("programming")]
         result = analyzer.analyze(slices, rules)
         assert result.deep_work_hours == 0.0
 
     def test_two_consecutive_same_type(self, analyzer):
         """Two consecutive slices of same type combine for deep work."""
-        slices = [_slice(9, 0, 15), _slice(9, 15, 15)]
+        slices = [_slice(9, 0, 10), _slice(9, 10, 10)]
         rules = [_rule("programming"), _rule("programming")]
         result = analyzer.analyze(slices, rules)
-        assert result.deep_work_hours >= 30 / 60
+        assert result.deep_work_hours >= 20 / 60
 
     def test_entertainment_not_deep(self, analyzer):
         """Entertainment never counts as deep work."""
@@ -79,27 +79,27 @@ class TestDeepWork:
         assert result.deep_work_hours == 0.0
 
     def test_short_afk_does_not_break_streak(self, analyzer):
-        """AFK <= 2 minutes does not interrupt deep work streak."""
+        """AFK <= 5 minutes does not interrupt deep work streak."""
         slices = [
-            _slice(9, 0, 15),                              # programming
-            _slice(9, 15, 1, is_afk=True),                 # 1min AFK (short)
-            _slice(9, 16, 15),                             # programming
+            _slice(9, 0, 10),                              # programming
+            _slice(9, 10, 4, is_afk=True),                 # 4min AFK (short)
+            _slice(9, 14, 10),                             # programming
         ]
         rules = [_rule("programming"), _rule("programming"), _rule("programming")]
         result = analyzer.analyze(slices, rules)
-        # 15 + 15 = 30 min streak, short AFK didn't break it
-        assert result.deep_work_hours >= 30 / 60
+        # 10 + 10 = 20 min streak, short AFK didn't break it
+        assert result.deep_work_hours >= 20 / 60
 
     def test_long_afk_breaks_streak(self, analyzer):
-        """AFK > 2 minutes breaks deep work streak."""
+        """AFK > 5 minutes breaks deep work streak."""
         slices = [
-            _slice(9, 0, 20),                              # programming 20min
-            _slice(9, 20, 5, is_afk=True),                 # 5min AFK (long)
-            _slice(9, 25, 20),                             # programming 20min
+            _slice(9, 0, 10),                              # programming 10min (< threshold)
+            _slice(9, 10, 6, is_afk=True),                 # 6min AFK (long)
+            _slice(9, 16, 10),                             # programming 10min (< threshold)
         ]
         rules = [_rule("programming"), _rule("programming"), _rule("programming")]
         result = analyzer.analyze(slices, rules)
-        # Neither 20min segment meets threshold alone
+        # Neither 10min segment meets 15min threshold alone
         assert result.deep_work_hours == 0.0
 
 
@@ -121,6 +121,13 @@ class TestSwitchCount:
         rules = [_rule("programming"), _rule("meeting"), _rule("programming"), _rule("social")]
         result = analyzer.analyze(slices, rules)
         assert result.switch_count == 3
+
+    def test_same_cluster_not_counted(self, analyzer):
+        """programming ↔ ai_assisted are the same work cluster."""
+        slices = [_slice(9, 0, 30), _slice(9, 30, 30)]
+        rules = [_rule("programming"), _rule("ai_assisted")]
+        result = analyzer.analyze(slices, rules)
+        assert result.switch_count == 0
 
     def test_brief_flicker_not_counted(self, analyzer):
         """A brief (<30s) type change should not count as a real switch."""

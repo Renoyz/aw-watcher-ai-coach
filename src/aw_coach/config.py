@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -24,7 +24,7 @@ DEFAULT_DATA_DIR = Path("~/.local/share/activitywatch/aw-watcher-ai-coach").expa
 
 
 class AnalysisConfig(BaseModel):
-    deep_work_threshold_minutes: int = 25
+    deep_work_threshold_minutes: int = 15
     distraction_apps: List[str] = [
         "youtube", "bilibili", "twitter", "reddit", "tiktok"
     ]
@@ -35,21 +35,48 @@ class AnalysisConfig(BaseModel):
     restrict_to_work_schedule: bool = False
 
 
+class PolicyConfig(BaseModel):
+    quiet_hours_enabled: bool = True
+    quiet_hours_start: str = "22:00"
+    quiet_hours_end: str = "08:00"
+
+
 class ReportConfig(BaseModel):
     daily_report_time: str = "21:00"
-    instant_summary_interval_hours: int = 1
+    morning_brief_time: str = "09:00"
+    instant_summary_interval_hours: int = 2
     notification_method: str = "both"
+    daily_notification_budget: int = 4
+    notification_cooldown_seconds: int = 600
+    background_ai_summary: bool = False
+    silent_if_effective_hours_below: float = 0.5
+    always_notify_signals: List[str] = ["stuck", "search_loop", "death_loop"]
+
+
+class TasksConfig(BaseModel):
+    enabled: bool = True
+    project_roots: List[str] = []
+    aliases: Dict[str, str] = {}
+    branch_patterns: List[str] = ["feat/*", "fix/*", "issue-*"]
+    user_task_label: str = ""
+    user_task_id: str = ""
+
+
+class CronJobConfig(BaseModel):
+    schedule: str = "every 4h"
+    template: str = "work_progress"
+    delivery: str = "inbox"
 
 
 class OpenAIConfig(BaseModel):
     """OpenAI-compatible API config. Also works for DeepSeek:
-    base_url = "https://api.deepseek.com", model = "deepseek-v4-flash"
+    base_url = "https://api.deepseek.com/v1", model = "deepseek-v4-flash"
     (deepseek-chat / deepseek-reasoner are deprecated on 2026-07-24)
     """
 
     api_key: str = ""
-    model: str = "gpt-4o-mini"
-    base_url: str = "https://api.openai.com/v1"
+    model: str = "deepseek-v4-flash"
+    base_url: str = "https://api.deepseek.com/v1"
 
 
 class LocalLLMConfig(BaseModel):
@@ -59,7 +86,7 @@ class LocalLLMConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    backend: str = "rule_only"
+    backend: str = "hybrid"
     openai: OpenAIConfig = OpenAIConfig()
     local: LocalLLMConfig = LocalLLMConfig()
 
@@ -72,7 +99,7 @@ class AIConfig(BaseModel):
 
 
 class CostConfig(BaseModel):
-    monthly_budget_usd: float = 5.0
+    monthly_budget_usd: float = 2.86  # ~¥20/month at 2026-06 exchange rate
     alert_thresholds: List[float] = [0.5, 0.8, 1.0]
 
 
@@ -85,6 +112,9 @@ class ScreenshotConfig(BaseModel):
 class Config(BaseModel):
     analysis: AnalysisConfig = AnalysisConfig()
     report: ReportConfig = ReportConfig()
+    policy: PolicyConfig = PolicyConfig()
+    tasks: TasksConfig = TasksConfig()
+    cron_jobs: List["CronJobConfig"] = []
     ai: AIConfig = AIConfig()
     cost: CostConfig = CostConfig()
     screenshot: ScreenshotConfig = ScreenshotConfig()

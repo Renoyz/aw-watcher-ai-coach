@@ -11,8 +11,18 @@ from aw_coach.collector import ActivitySlice
 from aw_coach.config import AnalysisConfig
 from aw_coach.rules.engine import RuleResult
 
-DEEP_WORK_TYPES = {"programming", "writing", "design", "research"}
+DEEP_WORK_TYPES = {"programming", "writing", "design", "research", "terminal"}
 DISTRACTION_TYPES = {"entertainment", "social"}
+# Non-deep-work types that briefly appear between deep-work blocks
+# without resetting the streak (up to this many seconds).
+PENETRATION_TOLERANCE = 180  # 3 minutes
+
+# Activity clusters: intra-cluster switches do not count as task switches.
+_ACTIVITY_CLUSTERS = {
+    "making": frozenset({"programming", "ai_assisted", "admin", "writing"}),
+    "research": frozenset({"research"}),
+    "comm": frozenset({"meeting", "social"}),
+}
 
 
 @dataclass
@@ -57,7 +67,7 @@ class PatternAnalyzer:
         switches = self._count_switches(slices, rules)
         breakdown = self._activity_breakdown(slices, rules)
         hourly = self._hourly_scores(slices, rules)
-        focus = self._focus_score(deep_work, switches, breakdown, total)
+        focus = self._focus_score(deep_work, switches, breakdown, total, effective)
         productivity = self._productivity_score(slices, rules)
         loops = self._detect_death_loops(slices, rules)
 
@@ -191,11 +201,12 @@ class PatternAnalyzer:
         if not slices:
             return 0.0
 
-        AFK_GAP_TOLERANCE = 120  # seconds - short breaks don't interrupt
+        AFK_GAP_TOLERANCE = 300  # seconds - 5min breaks don't interrupt
 
         deep_seconds = 0.0
         current_type = None
         current_streak_sec = 0.0
+        penetration_sec = 0.0  # Time in tolerated non-deep-work gaps
 
         for s, r in zip(slices, rules):
             if getattr(r, "skip_analysis", False):
@@ -203,6 +214,7 @@ class PatternAnalyzer:
                     deep_seconds += current_streak_sec
                 current_type = None
                 current_streak_sec = 0.0
+                penetration_sec = 0.0
                 continue
 
             if s.is_afk:
@@ -214,6 +226,7 @@ class PatternAnalyzer:
                         deep_seconds += current_streak_sec
                     current_type = None
                     current_streak_sec = 0.0
+                    penetration_sec = 0.0
                     continue
 
             segments = self._analysis_segments(s, r)
@@ -222,30 +235,46 @@ class PatternAnalyzer:
                     deep_seconds += current_streak_sec
                 current_type = None
                 current_streak_sec = 0.0
+                penetration_sec = 0.0
                 continue
 
             for segment in segments:
                 activity_type = self._activity_type(segment, r)
 
                 if activity_type not in DEEP_WORK_TYPES:
+                    # Tolerate brief "unknown" gaps without breaking streak
+                    if activity_type == "unknown" and penetration_sec < PENETRATION_TOLERANCE:
+                        penetration_sec += segment.duration
+                        continue
+
                     if current_streak_sec >= self.deep_work_threshold * 60:
                         deep_seconds += current_streak_sec
                     current_type = None
                     current_streak_sec = 0.0
+                    penetration_sec = 0.0
                     continue
 
                 if activity_type == current_type:
                     current_streak_sec += segment.duration
+                    penetration_sec = 0.0
                 else:
                     if current_streak_sec >= self.deep_work_threshold * 60:
                         deep_seconds += current_streak_sec
                     current_type = activity_type
                     current_streak_sec = segment.duration
+                    penetration_sec = 0.0
 
         if current_streak_sec >= self.deep_work_threshold * 60:
             deep_seconds += current_streak_sec
 
         return deep_seconds / 3600
+
+    @staticmethod
+    def _activity_cluster(activity_type: str) -> str:
+        for cluster, types in _ACTIVITY_CLUSTERS.items():
+            if activity_type in types:
+                return cluster
+        return "other"
 
     def _count_switches(self, slices: List[ActivitySlice], rules: List[RuleResult]) -> int:
         if len(rules) < 2:
@@ -266,16 +295,16 @@ class PatternAnalyzer:
                 else:
                     segments.append((activity_type, segment.duration))
 
-        # Filter out noise segments (< threshold) by absorbing into neighbors
+        # Filter noise, map to work clusters, count cluster transitions only
         filtered: List[str] = []
         for activity_type, duration in segments:
             if duration < DEBOUNCE_THRESHOLD:
-                continue  # Skip brief flickers
-            if filtered and filtered[-1] == activity_type:
-                continue  # Same as previous sustained segment
-            filtered.append(activity_type)
+                continue
+            cluster = self._activity_cluster(activity_type)
+            if filtered and filtered[-1] == cluster:
+                continue
+            filtered.append(cluster)
 
-        # Count transitions in filtered list
         return max(0, len(filtered) - 1)
 
     def _activity_breakdown(
@@ -310,7 +339,8 @@ class PatternAnalyzer:
             switches = self._count_switches(h_slices, h_rules)
             breakdown = self._activity_breakdown(h_slices, h_rules)
             total = self._total_hours(h_slices, h_rules)
-            score = self._focus_score(deep, switches, breakdown, total)
+            effective = self._effective_hours(h_slices, h_rules)
+            score = self._focus_score(deep, switches, breakdown, total, effective)
             scores.append((hour, score))
 
         return scores
@@ -351,13 +381,18 @@ class PatternAnalyzer:
         switch_count: int,
         breakdown: Dict[str, float],
         total_hours: float,
+        effective_hours: float = 0.0,
     ) -> int:
         score = 60.0
 
         deep_work_bonus = min(deep_work_hours * 2 * 10, 30)
         score += deep_work_bonus
 
-        switch_penalty = min(switch_count * 3, 30)
+        if effective_hours > 0:
+            switch_rate = switch_count / effective_hours
+            switch_penalty = min(switch_rate * 4, 30)
+        else:
+            switch_penalty = min(switch_count * 3, 30)
         score -= switch_penalty
 
         if total_hours > 0:

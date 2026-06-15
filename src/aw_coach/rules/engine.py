@@ -17,13 +17,15 @@ class RuleResult:
     rule_name: Optional[str] = None
     weight: Optional[float] = None
     skip_analysis: bool = False
+    skip_screenshot: bool = False
 
 
 DEFAULT_WEIGHTS = {
     "programming": 1.0,
+    "ai_assisted": 0.9,
     "writing": 0.9,
     "design": 0.9,
-    "research": 0.7,
+    "research": 0.8,
     "meeting": 0.4,
     "admin": 0.3,
     "social": -0.2,
@@ -107,6 +109,7 @@ class RuleEngine:
                         rule_name=rule.name,
                         weight=w,
                         skip_analysis=rule.skip_analysis,
+                        skip_screenshot=rule.skip_screenshot,
                     )
 
         # Determine weight
@@ -121,6 +124,7 @@ class RuleEngine:
                 rule_name=rule.name,
                 weight=w,
                 skip_analysis=rule.skip_analysis,
+                skip_screenshot=rule.skip_screenshot,
             )
 
         # Low confidence app match (e.g., browser without sub-rule hit)
@@ -131,6 +135,7 @@ class RuleEngine:
             rule_name=rule.name,
             weight=w,
             skip_analysis=rule.skip_analysis,
+            skip_screenshot=rule.skip_screenshot,
         )
 
     def _sub_matches(self, sub: SubRule, title: str, url: Optional[str]) -> bool:

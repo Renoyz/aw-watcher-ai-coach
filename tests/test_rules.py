@@ -59,9 +59,10 @@ class TestBrowserSubRules:
         assert r.activity_type == "programming"
         assert r.confidence >= 0.75
 
-    def test_stackoverflow_programming(self, engine):
+    def test_stackoverflow_research(self, engine):
         r = engine.classify("chrome", "python - How to...", "https://stackoverflow.com/q/123")
-        assert r.activity_type == "programming"
+        assert r.activity_type == "research"
+        assert r.confidence >= 0.85
 
     def test_bilibili_entertainment(self, engine):
         r = engine.classify("chrome", "bilibili - video", "https://bilibili.com")
@@ -81,13 +82,28 @@ class TestBrowserSubRules:
         r = engine.classify("chrome", "Python教程 - CSDN", "https://csdn.net/article")
         assert r.activity_type == "programming"
 
-    def test_copilot_chat_browser_is_programming(self, engine):
+    def test_copilot_chat_browser_is_ai_assisted(self, engine):
         r = engine.classify(
             "chrome",
             "GitHub Copilot Chat",
             "https://github.com/copilot",
         )
-        assert r.activity_type == "programming"
+        assert r.activity_type == "ai_assisted"
+        assert r.confidence >= 0.85
+
+    def test_chatgpt_ai_assisted(self, engine):
+        r = engine.classify("chrome", "ChatGPT", "https://chatgpt.com/c/abc")
+        assert r.activity_type == "ai_assisted"
+        assert r.confidence >= 0.85
+
+    def test_claude_ai_assisted(self, engine):
+        r = engine.classify("firefox", "Claude", "https://claude.ai/chat")
+        assert r.activity_type == "ai_assisted"
+        assert r.confidence >= 0.85
+
+    def test_docs_rs_research(self, engine):
+        r = engine.classify("chrome", "tokio - Rust", "https://docs.rs/tokio/latest")
+        assert r.activity_type == "research"
         assert r.confidence >= 0.85
 
 

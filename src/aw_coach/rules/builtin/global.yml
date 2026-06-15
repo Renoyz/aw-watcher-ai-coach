@@ -64,10 +64,11 @@ rules:
 
   # === Browsers ===
   - name: browser
-    match_apps: ["chrome", "chromium", "firefox", "safari", "edge", "arc", "brave", "vivaldi", "opera"]
+    match_apps: ["chrome", "chromium", "firefox", "safari", "edge", "arc", "brave", "vivaldi", "opera", "firefox_firefox", "librewolf", "firefox-esr"]
     default_type: research
     confidence: 0.50
     sub_rules:
+      # --- Entertainment (highest confidence, block first) ---
       - match_titles: ["youtube", "netflix", "twitch", "hulu", "disney+", "bilibili"]
         type: entertainment
         confidence: 0.95
@@ -80,24 +81,44 @@ rules:
       - match_urls: ["reddit.com", "twitter.com", "x.com", "instagram.com", "tiktok.com", "facebook.com"]
         type: entertainment
         confidence: 0.90
+
+      # --- AI-assisted coding tools ---
       - match_titles: ["copilot chat", "github copilot", "claude code", "cursor agent", "openai codex", "aider"]
-        type: programming
-        confidence: 0.90
+        type: ai_assisted
+        confidence: 0.92
+        weight: 0.9
       - match_urls: ["github.com/copilot", "claude.ai", "chatgpt.com", "chat.openai.com", "cursor.com", "aider.chat"]
-        type: programming
+        type: ai_assisted
+        confidence: 0.90
+        weight: 0.9
+
+      # --- Documentation & Research (high-confidence URL matches) ---
+      - match_urls: ["stackoverflow.com", "stackexchange.com", "docs.rs", "docs.python.org", "pkg.go.dev", "developer.mozilla.org", "docs.oracle.com", "docs.microsoft.com", "readthedocs.io", "arxiv.org", "wikipedia.org"]
+        type: research
+        confidence: 0.90
+        weight: 0.8
+      - match_titles: ["stackoverflow", "stack overflow", "documentation", "docs.rs"]
+        type: research
         confidence: 0.85
-      - match_urls: ["github.com", "gitlab.com", "bitbucket.org", "stackoverflow.com", "stackexchange.com"]
+        weight: 0.8
+
+      # --- Collaboration & Code review ---
+      - match_urls: ["github.com", "gitlab.com", "bitbucket.org"]
         type: programming
         confidence: 0.80
-      - match_titles: ["github", "gitlab", "stackoverflow", "stack overflow"]
+      - match_titles: ["github", "gitlab"]
         type: programming
         confidence: 0.80
+
+      # --- Project management ---
       - match_urls: ["jira.atlassian.com", "confluence.atlassian.com", "trello.com", "notion.so", "linear.app", "asana.com"]
         type: admin
         confidence: 0.85
       - match_titles: ["jira", "confluence", "trello", "notion", "linear", "asana"]
         type: admin
         confidence: 0.80
+
+      # --- Writing / Docs ---
       - match_urls: ["docs.google.com", "docs.new"]
         type: writing
         confidence: 0.80

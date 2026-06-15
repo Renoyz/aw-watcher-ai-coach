@@ -98,6 +98,28 @@ class TestOpenAIBackend:
 
 
 class TestHybridBackend:
+    def test_default_hybrid_without_api_key_falls_back_to_rules(self):
+        """Default hybrid config must stay local-only until an API key is configured."""
+        from aw_coach.classifier import RuleOnlyClassifier, create_classifier
+        from aw_coach.config import Config
+
+        fallbacks = []
+        classifier = create_classifier(Config(), on_hybrid_fallback=fallbacks.append)
+
+        assert isinstance(classifier, RuleOnlyClassifier)
+        assert len(fallbacks) == 1
+        assert "api_key" in str(fallbacks[0])
+
+    def test_openai_without_api_key_still_errors(self):
+        """Pure OpenAI mode is explicit and should not silently fall back."""
+        from aw_coach.classifier import create_classifier
+        from aw_coach.config import AIConfig, Config
+
+        config = Config(ai=AIConfig(backend="openai"))
+
+        with pytest.raises(ValueError, match="requires ai.openai.api_key"):
+            create_classifier(config)
+
     def test_all_confident_skips_llm(self, storage):
         """When all slices are confidently classified by rules, LLM is not called."""
         rule_engine = RuleEngine.with_builtin_rules()
@@ -115,11 +137,11 @@ class TestHybridBackend:
         mock_llm.batch_classify.assert_not_called()
 
     def test_uncertain_triggers_llm(self, storage):
-        """Slices below threshold trigger LLM batch call."""
+        """Slices with confidence between low_threshold and threshold trigger LLM."""
         rule_engine = RuleEngine.with_builtin_rules()
         mock_llm = MagicMock(spec=AIBackend)
         mock_llm.batch_classify.return_value = [
-            ClassificationResult("entertainment", 0.85, "llm_batch"),
+            ClassificationResult("programming", 0.85, "llm_batch"),
         ]
         mock_llm.estimate_cost.return_value = 0.02
         config = CostConfig(monthly_budget_usd=5.0)
@@ -127,14 +149,32 @@ class TestHybridBackend:
 
         hybrid = HybridBackend(rule_engine, mock_llm, cost, threshold=0.85)
 
-        # "random-app" won't match any rule
-        slices = [_slice("Code", "main.py"), _slice("random-unknown-app", "window")]
+        # "firefox" matches browser rule with confidence=0.50 (above low_threshold)
+        slices = [_slice("Code", "main.py"), _slice("firefox", "docs — Mozilla Firefox")]
         results = hybrid.batch_classify(slices)
 
         assert len(results) == 2
         assert results[0].activity_type == "programming"  # Rule hit
-        assert results[1].activity_type == "entertainment"  # LLM result
+        assert results[1].activity_type == "programming"  # LLM result
         mock_llm.batch_classify.assert_called_once()
+
+    def test_low_confidence_skips_llm(self, storage):
+        """Slices below low_confidence_threshold skip queue and LLM."""
+        rule_engine = RuleEngine.with_builtin_rules()
+        mock_llm = MagicMock(spec=AIBackend)
+        config = CostConfig(monthly_budget_usd=5.0)
+        cost = CostController(config, storage)
+
+        hybrid = HybridBackend(rule_engine, mock_llm, cost, threshold=0.85)
+
+        # "random-app" won't match any rule -> confidence=0.0
+        slices = [_slice("random-unknown-app", "window")]
+        results = hybrid.batch_classify(slices)
+
+        assert len(results) == 1
+        assert results[0].activity_type == "unknown"
+        assert results[0].method == "rule_low_conf"
+        mock_llm.batch_classify.assert_not_called()
 
     def test_budget_exceeded_returns_unknown(self, storage):
         """When budget is exceeded, uncertain slices stay unknown."""

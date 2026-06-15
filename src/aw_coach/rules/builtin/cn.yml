@@ -85,22 +85,25 @@ rules:
 
   # === 浏览器标题补充规则 ===
   - name: browser_cn
-    match_apps: ["chrome", "chromium", "firefox", "edge"]
+    match_apps: ["chrome", "chromium", "firefox", "edge", "firefox_firefox", "librewolf", "firefox-esr"]
     default_type: research
     confidence: 0.50
     sub_rules:
       - match_titles: ["bilibili", "哔哩哔哩", "b站"]
         type: entertainment
         confidence: 0.95
-      - match_urls: ["bilibili.com", "zhihu.com"]
+      - match_urls: ["bilibili.com", "douyin.com", "kuaishou.com"]
         type: entertainment
-        confidence: 0.85
-      - match_titles: ["知乎"]
+        confidence: 0.95
+      - match_titles: ["知乎", "zhihu"]
         type: research
         confidence: 0.65
-      - match_urls: ["juejin.cn", "segmentfault.com", "csdn.net"]
+      - match_urls: ["zhihu.com"]
+        type: research
+        confidence: 0.65
+      - match_urls: ["juejin.cn", "segmentfault.com", "csdn.net", "cnblogs.com"]
         type: programming
         confidence: 0.75
-      - match_titles: ["掘金", "csdn"]
+      - match_titles: ["掘金", "csdn", "博客园", "segmentfault"]
         type: programming
         confidence: 0.75

@@ -25,6 +25,18 @@ class RuleOnlyClassifier:
         ]
 
 
+class LLMOnlyClassifier:
+    """Pure LLM classification without rule engine."""
+
+    def __init__(self, llm_backend):
+        self.llm = llm_backend
+
+    def batch_classify(self, slices: List[ActivitySlice]):
+        if not slices:
+            return []
+        return self.llm.batch_classify(slices)
+
+
 def create_classifier(
     config: Config,
     on_hybrid_fallback: Optional[Callable[[Exception], None]] = None,
@@ -32,7 +44,39 @@ def create_classifier(
     """Create the configured classifier, falling back to rules if hybrid cannot start."""
     rule_engine = RuleEngine.with_all_rules()
 
+    def fallback_to_rules(reason: Exception) -> RuleOnlyClassifier:
+        if on_hybrid_fallback is not None:
+            on_hybrid_fallback(reason)
+        else:
+            logger.warning(
+                "Failed to initialize hybrid backend; falling back to rule_only: %s",
+                reason,
+            )
+        return RuleOnlyClassifier(rule_engine)
+
+    if config.ai.backend == "openai":
+        if not config.ai.openai.api_key:
+            raise ValueError(
+                "ai.backend=openai requires ai.openai.api_key. "
+                "Set it in config or use ${ENV_VAR}."
+            )
+        from aw_coach.ai.openai_backend import OpenAIBackend
+
+        llm = OpenAIBackend(
+            api_key=config.ai.openai.api_key,
+            model=config.ai.openai.model,
+            base_url=config.ai.openai.base_url,
+        )
+        return LLMOnlyClassifier(llm)
+
     if config.ai.backend == "hybrid":
+        if not config.ai.openai.api_key:
+            return fallback_to_rules(
+                ValueError(
+                    "ai.backend=hybrid has no ai.openai.api_key; "
+                    "using rule_only fallback"
+                )
+            )
         try:
             from aw_coach.ai.cost import CostController
             from aw_coach.ai.hybrid import HybridBackend
@@ -48,13 +92,7 @@ def create_classifier(
             cost = CostController(config.cost, storage)
             return HybridBackend(rule_engine, llm, cost, storage=storage)
         except Exception as e:
-            if on_hybrid_fallback is not None:
-                on_hybrid_fallback(e)
-            else:
-                logger.warning(
-                    "Failed to initialize hybrid backend; falling back to rule_only.",
-                    exc_info=True,
-                )
+            return fallback_to_rules(e)
 
     return RuleOnlyClassifier(rule_engine)
 

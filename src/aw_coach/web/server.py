@@ -84,6 +84,18 @@ class InteractiveReportServer:
                 if path == "/api/timeline":
                     self._send_json({"items": list(server._timeline_by_id.values())})
                     return
+                if path == "/api/inbox":
+                    storage = Storage(server.config.db_path)
+                    items = storage.get_inbox_items(dismissed=False, limit=50)
+                    self._send_json({"items": items})
+                    return
+                if path == "/api/tasks":
+                    storage = Storage(server.config.db_path)
+                    day = server.target.isoformat()
+                    summary = storage.get_task_daily_summary(day)
+                    sessions = storage.get_task_sessions_for_day(day)
+                    self._send_json({"summary": summary, "sessions": sessions})
+                    return
                 self.send_error(404)
 
             def do_POST(self) -> None:
@@ -100,6 +112,21 @@ class InteractiveReportServer:
                         return
 
                     self._send_json(response)
+                    return
+
+                if path == "/api/inbox/dismiss":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                        item_id = int(payload.get("id", 0))
+                        storage = Storage(server.config.db_path)
+                        storage.dismiss_inbox_item(item_id)
+                        self._send_json({"ok": True, "id": item_id})
+                    except (ValueError, TypeError) as e:
+                        self._send_json({"error": str(e)}, status=400)
+                    except Exception as e:
+                        logger.exception("Inbox dismiss API failed")
+                        self._send_json({"error": str(e)}, status=500)
                     return
 
                 if path != "/api/corrections":

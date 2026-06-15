@@ -13,9 +13,9 @@ def test_default_config_no_file():
 
     config = load_config(config_path=Path("/nonexistent/path.toml"))
     assert isinstance(config, Config)
-    assert config.ai.backend == "rule_only"
-    assert config.cost.monthly_budget_usd == 5.0
-    assert config.analysis.deep_work_threshold_minutes == 25
+    assert config.ai.backend == "hybrid"
+    assert config.cost.monthly_budget_usd == 2.86
+    assert config.analysis.deep_work_threshold_minutes == 15
     assert config.report.daily_report_time == "21:00"
 
 
@@ -40,7 +40,7 @@ monthly_budget_usd = 10.0
     assert config.ai.backend == "hybrid"
     assert config.cost.monthly_budget_usd == 10.0
     # Defaults preserved
-    assert config.analysis.deep_work_threshold_minutes == 25
+    assert config.analysis.deep_work_threshold_minutes == 15
     assert config.report.daily_report_time == "21:00"
 
 

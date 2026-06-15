@@ -211,3 +211,61 @@ class TestActivitySlice:
         assert s.primary_app == "vscode"
         assert s.web_url is None
         assert s.duration == 300
+
+    def test_slice_domain_extraction(self):
+        from aw_coach.collector import _enrich_slice_from_url
+        s = ActivitySlice(
+            start=datetime(2026, 5, 30, 9, 0),
+            end=datetime(2026, 5, 30, 9, 5),
+            duration=300,
+            is_afk=False,
+            primary_app="chrome",
+            primary_title="GitHub",
+            web_url="https://github.com/user/repo/issues/42",
+        )
+        _enrich_slice_from_url(s)
+        assert s.domain == "github.com"
+        assert s.url_path == "/user/repo/issues/42"
+        assert s.site_type == "issue"
+
+    def test_slice_site_type_github_repo(self):
+        from aw_coach.collector import _enrich_slice_from_url
+        s = ActivitySlice(
+            start=datetime(2026, 5, 30, 9, 0),
+            end=datetime(2026, 5, 30, 9, 5),
+            duration=300,
+            is_afk=False,
+            primary_app="chrome",
+            primary_title="repo/blob/main.py",
+            web_url="https://github.com/user/repo/blob/main/src/main.py",
+        )
+        _enrich_slice_from_url(s)
+        assert s.site_type == "repo"
+
+    def test_slice_site_type_docs(self):
+        from aw_coach.collector import _enrich_slice_from_url
+        s = ActivitySlice(
+            start=datetime(2026, 5, 30, 9, 0),
+            end=datetime(2026, 5, 30, 9, 5),
+            duration=300,
+            is_afk=False,
+            primary_app="chrome",
+            primary_title="Python docs",
+            web_url="https://docs.python.org/3/library/os.html",
+        )
+        _enrich_slice_from_url(s)
+        assert s.site_type == "docs"
+
+    def test_slice_enrich_in_merge_events(self):
+        t0 = datetime(2026, 5, 30, 9, 0)
+        windows = [{
+            "timestamp": t0,
+            "duration": timedelta(seconds=300),
+            "data": {"app": "chrome", "title": "GitHub", "url": "https://github.com/user/repo/pull/1"},
+        }]
+        afk = [_make_afk_event(t0, 300, "not-afk")]
+
+        slices = merge_events(windows, afk)
+        assert len(slices) == 1
+        assert slices[0].domain == "github.com"
+        assert slices[0].site_type == "pr"

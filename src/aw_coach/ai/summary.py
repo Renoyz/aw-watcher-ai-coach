@@ -33,8 +33,7 @@ def generate_ai_summary(
         if not cost_controller.can_use_llm(estimated_cost):
             raise ValueError("LLM 月度预算已用尽，无法生成总结。")
 
-    response = backend.client.chat.completions.create(
-        model=backend.model,
+    response = backend.chat_completion(
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
         max_tokens=500,
