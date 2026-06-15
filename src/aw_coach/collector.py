@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 
 def _local_to_utc(dt: datetime) -> datetime:
@@ -31,6 +32,16 @@ class ActivitySlice:
     primary_app: str
     primary_title: str
     web_url: Optional[str] = None
+    # Enriched fields (Phase 3)
+    domain: Optional[str] = None
+    url_path: Optional[str] = None
+    site_type: Optional[str] = None
+    process_name: Optional[str] = None
+    process_cwd: Optional[str] = None
+    git_repo: Optional[str] = None
+    git_branch: Optional[str] = None
+    terminal_command: Optional[str] = None
+    screen_context: Optional[str] = None
 
 
 BROWSER_APPS = frozenset([
@@ -144,6 +155,14 @@ def merge_events(
     if web_events:
         _enrich_with_web_urls(slices, web_events)
 
+    # Phase 3: enrich with domain, path, site_type
+    # Note: process/git enrichment is NOT done here because it reads live
+    # system state and would corrupt historical slices.  The scheduler
+    # enriches only the latest slice on its tick.
+    for s in slices:
+        _enrich_slice_from_url(s)
+        _enrich_slice_from_git(s)
+
     return slices
 
 
@@ -181,6 +200,63 @@ def _enrich_with_web_urls(
 
         if best_url:
             s.web_url = best_url
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: slice enrichment helpers
+# ---------------------------------------------------------------------------
+
+def _enrich_slice_from_url(s: ActivitySlice) -> None:
+    """Extract domain, url_path, site_type from web_url."""
+    if not s.web_url:
+        return
+    try:
+        parsed = urlparse(s.web_url)
+    except Exception:
+        return
+    s.domain = parsed.netloc.lower()
+    s.url_path = parsed.path
+
+    path = parsed.path.lower()
+    netloc = parsed.netloc.lower()
+
+    # Site type inference
+    if "/issues/" in path or "/issue/" in path:
+        s.site_type = "issue"
+    elif "/pull/" in path or "/merge_requests/" in path:
+        s.site_type = "pr"
+    elif "/blob/" in path or "/tree/" in path or "/commit/" in path:
+        s.site_type = "repo"
+    elif any(d in netloc for d in ("stackoverflow", "docs.", "readthedocs", "python.org", "developer.mozilla.org")):
+        s.site_type = "docs"
+    elif "/search" in path or any(d in netloc for d in ("google.com", "bing.com", "duckduckgo.com")):
+        s.site_type = "search"
+    elif any(d in netloc for d in ("youtube.com", "bilibili.com", "vimeo.com")):
+        s.site_type = "video"
+    elif any(d in netloc for d in ("slack.com", "discord.com", "telegram.org", "web.telegram.org")):
+        s.site_type = "chat"
+    else:
+        s.site_type = "other"
+
+
+def _enrich_slice_from_git(s: ActivitySlice) -> None:
+    """Extract git repo/branch from process cwd.
+
+    NOTE: This is currently a no-op because process_cwd is never populated
+    for historical slices (it would require live system state).  If AW window
+    events include pid in the future, this can be wired for the *latest* slice
+    only, inside the scheduler tick.
+    """
+    cwd = s.process_cwd
+    if cwd:
+        try:
+            from aw_coach.git_context import get_git_context_from_path
+            git_ctx = get_git_context_from_path(cwd)
+            if git_ctx:
+                s.git_repo = git_ctx.repo_name
+                s.git_branch = git_ctx.branch
+        except Exception:
+            pass
 
 
 class DataCollector:

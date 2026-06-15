@@ -108,9 +108,47 @@ class TestTitleParserBrowser:
         ctx = p.parse("chrome", "GitHub - x_system", url=None)
         assert ctx.site == "github"
 
+    def test_browser_title_no_pseudo_project(self):
+        """Browser titles must not yield app names as projects without URL."""
+        p = TitleParser()
+        ctx = p.parse("firefox_firefox", "Kimi — Mozilla Firefox", url=None)
+        assert ctx.project is None
+        assert ctx.site is None
+
+    def test_browser_webmail_title_not_ssh_prompt(self):
+        """user@mail.com: subject in a browser is not a terminal prompt."""
+        p = TitleParser()
+        ctx = p.parse("firefox", "yz@gmail.com: Re: 会议纪要 — Mozilla Firefox", url=None)
+        assert ctx.project is None
+        assert ctx.remote_host is None
+
 
 class TestTitleParserTerminal:
     """Terminal window titles."""
+
+    def test_ssh_tilde_no_project(self):
+        p = TitleParser()
+        ctx = p.parse("gnome-terminal", "sunrise@ubuntu: ~")
+        assert ctx.project is None
+        assert ctx.remote_host == "ubuntu"
+
+    def test_ssh_remote_cwd_project(self, monkeypatch):
+        monkeypatch.setattr(
+            "aw_coach.context_parser.socket.gethostname", lambda: "local-laptop"
+        )
+        p = TitleParser()
+        ctx = p.parse("gnome-terminal", "sunrise@ubuntu: ~/x_system")
+        assert ctx.project == "x_system@ubuntu"
+        assert ctx.remote_host == "ubuntu"
+
+    def test_ssh_local_cwd_project(self, monkeypatch):
+        monkeypatch.setattr(
+            "aw_coach.context_parser.socket.gethostname",
+            lambda: "yz-Legion-Y7000-IRX9",
+        )
+        p = TitleParser()
+        ctx = p.parse("gnome-terminal", "yz@yz-Legion-Y7000-IRX9: ~/下载")
+        assert ctx.project == "下载"
 
     def test_terminal_path(self):
         p = TitleParser()
@@ -121,6 +159,37 @@ class TestTitleParserTerminal:
         p = TitleParser()
         ctx = p.parse("alacritty", "~/ros2_ws/src/x_system")
         assert ctx.project == "x_system"
+
+    def test_git_commit_no_project(self):
+        """git commit -am 'wip' should NOT produce a project name from flags."""
+        p = TitleParser()
+        ctx = p.parse("alacritty", "git commit -am 'wip'")
+        assert ctx.project is None
+        assert ctx.action_hint == "committing"
+
+    def test_pytest_no_project(self):
+        """pytest -v should NOT produce project='v'."""
+        p = TitleParser()
+        ctx = p.parse("alacritty", "pytest -v")
+        assert ctx.project is None
+        assert ctx.action_hint == "testing"
+
+    def test_cargo_build_no_project(self):
+        """cargo build should not be split into project names."""
+        p = TitleParser()
+        ctx = p.parse("alacritty", "cargo build --release")
+        assert ctx.project is None
+
+    def test_docker_run_no_project(self):
+        p = TitleParser()
+        ctx = p.parse("alacritty", "docker run -it ubuntu")
+        assert ctx.project is None
+
+    def test_npm_install_no_project(self):
+        p = TitleParser()
+        ctx = p.parse("alacritty", "npm install")
+        assert ctx.project is None
+        assert ctx.action_hint is None
 
 
 class TestTitleParserActionHints:

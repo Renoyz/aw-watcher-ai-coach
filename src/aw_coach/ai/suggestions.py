@@ -48,8 +48,7 @@ def generate_ai_suggestions(
             return _fallback_suggestions(analysis, is_weekly)
 
     try:
-        response = backend.client.chat.completions.create(
-            model=backend.model,
+        response = backend.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.4,
             max_tokens=600,

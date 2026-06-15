@@ -139,7 +139,10 @@ class TestAssembler:
         assert state.semantic_filename == "main.py"
         assert state.semantic_language == "python"
         assert state.likely_mode == "coding"
+        # risk_level keeps old heuristic semantics
         assert state.risk_level == "normal"
+        # FocusBlockDetector writes to detected_signal instead
+        assert state.detected_signal == "focused"
 
     def test_browser_with_url(self):
         assembler = EnrichedStateAssembler()
@@ -258,3 +261,98 @@ class TestSemanticWorkState:
         display = state.to_display_dict()
         assert display["窗口标题"].endswith("...")
         assert len(display["窗口标题"]) <= 55
+
+    def test_visual_fields_serialize(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).astimezone()
+        state = SemanticWorkState(
+            updated_at=now,
+            current_app="x",
+            current_title="y",
+            screen_ocr_text="pytest failed",
+            screen_diff_ratio=0.05,
+            screen_content_type="scrolling",
+            terminal_command="pytest -v",
+        )
+        d = state.to_dict()
+        assert d["screen_ocr_text"] == "pytest failed"
+        assert d["screen_diff_ratio"] == 0.05
+        assert d["screen_content_type"] == "scrolling"
+        assert d["terminal_command"] == "pytest -v"
+
+    def test_display_dict_includes_visual(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).astimezone()
+        state = SemanticWorkState(
+            updated_at=now,
+            current_app="x",
+            current_title="y",
+            screen_ocr_text="error in main.py",
+            screen_content_type="static",
+            terminal_command="python main.py",
+        )
+        display = state.to_display_dict()
+        assert "终端命令" in display
+        assert "OCR预览" in display
+        assert "屏幕类型" in display
+
+
+# ---------------------------------------------------------------------------
+# OCR Refinement
+# ---------------------------------------------------------------------------
+
+class TestOCRRefinement:
+    def test_ocr_error_to_debugging(self):
+        assembler = EnrichedStateAssembler()
+        state = assembler.assemble(
+            app="Code",
+            title="main.py",
+            active_block_minutes=10,
+            screen_ocr_text="Traceback (most recent call last):\nValueError: invalid",
+        )
+        assert state.likely_mode == "debugging"
+
+    def test_ocr_stackoverflow_to_researching(self):
+        assembler = EnrichedStateAssembler()
+        state = assembler.assemble(
+            app="Chrome",
+            title="Python list comprehension - Stack Overflow",
+            url="https://stackoverflow.com/questions/123",
+            active_block_minutes=10,
+            screen_ocr_text="Stack Overflow\nPython list comprehension",
+        )
+        assert state.likely_mode == "researching"
+
+    def test_ocr_static_debug_screen_to_stuck(self):
+        assembler = EnrichedStateAssembler()
+        state = assembler.assemble(
+            app="Code",
+            title="main.py",
+            active_block_minutes=35,
+            screen_ocr_text="Exception: connection refused\n  File main.py, line 42",
+            screen_content_type="static",
+        )
+        assert state.likely_mode == "debugging"
+        assert state.risk_level == "stuck"
+
+    def test_ocr_no_change_when_confident(self):
+        assembler = EnrichedStateAssembler()
+        state = assembler.assemble(
+            app="Zoom",
+            title="Team Standup",
+            active_block_minutes=15,
+            rule_activity="meeting",
+            screen_ocr_text="some random text error",
+        )
+        # Zoom meeting should not become debugging just because OCR saw "error"
+        assert state.likely_mode == "meeting"
+
+    def test_ocr_code_heuristic(self):
+        assembler = EnrichedStateAssembler()
+        state = assembler.assemble(
+            app="UnknownApp",
+            title="Window",
+            active_block_minutes=5,
+            screen_ocr_text="def foo():\n    import os\n    class Bar:\n        pass",
+        )
+        assert state.likely_mode == "coding"

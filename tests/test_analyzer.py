@@ -122,6 +122,13 @@ class TestSwitchCount:
         result = analyzer.analyze(slices, rules)
         assert result.switch_count == 3
 
+    def test_same_cluster_not_counted(self, analyzer):
+        """programming ↔ ai_assisted are the same work cluster."""
+        slices = [_slice(9, 0, 30), _slice(9, 30, 30)]
+        rules = [_rule("programming"), _rule("ai_assisted")]
+        result = analyzer.analyze(slices, rules)
+        assert result.switch_count == 0
+
     def test_brief_flicker_not_counted(self, analyzer):
         """A brief (<30s) type change should not count as a real switch."""
         # programming 5min, then 10s of 'research', then back to programming 5min

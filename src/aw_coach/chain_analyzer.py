@@ -223,8 +223,18 @@ class ChainAnalyzer:
         if len(modes) < 2:
             return 0.0
 
-        # Mode switches per record
-        switches = sum(1 for i in range(len(modes) - 1) if modes[i] != modes[i + 1])
+        # Mode switches per record, with exemptions for reasonable work-flow transitions
+        switches = 0
+        for i in range(len(modes) - 1):
+            a, b = modes[i], modes[i + 1]
+            if a == b:
+                continue
+            # Exempt coding↔researching/debugging if the research/debug step is brief
+            if self._is_reasonable_transition(window, i, a, b):
+                switches += 0.5  # count as half a switch
+            else:
+                switches += 1.0
+
         switch_ratio = switches / (len(modes) - 1)
 
         # Risk-level contributions
@@ -234,6 +244,28 @@ class ChainAnalyzer:
         risk_boost = min(risk_boost, 0.3)
 
         return min(1.0, switch_ratio * 0.7 + risk_boost)
+
+    def _is_reasonable_transition(
+        self, window: List[SemanticWorkState], idx: int, a: str, b: str
+    ) -> bool:
+        """Return True if a→b is a normal coding workflow (e.g. coding→researching→coding)."""
+        reasonable_pairs = {
+            ("coding", "researching"),
+            ("researching", "coding"),
+            ("coding", "debugging"),
+            ("debugging", "coding"),
+            ("coding", "testing"),
+            ("testing", "coding"),
+        }
+        if (a, b) not in reasonable_pairs:
+            return False
+        # Only exempt if the non-coding step is brief (< 15 min)
+        non_coding = a if a != "coding" else b
+        if non_coding in ("researching", "debugging", "testing"):
+            record = window[idx] if idx < len(window) else None
+            if record and getattr(record, "active_block_minutes", 0) < 15:
+                return True
+        return False
 
     @staticmethod
     def _longest_consecutive_mode(modes: List[str]) -> int:
@@ -271,6 +303,8 @@ class ChainAnalyzer:
             return "研究模式：在编码和查阅资料之间切换"
 
         if pattern == "context_switching":
+            if depth >= 0.5:
+                return f"工作状态活跃，在编码和查阅资料间切换（碎片度 {int(frag*100)}%）"
             return f"上下文频繁切换（碎片度 {int(frag*100)}%），建议聚焦单一任务"
 
         if pattern == "meeting_block":
@@ -283,6 +317,8 @@ class ChainAnalyzer:
             return "高度专注状态"
 
         if frag >= 0.6:
+            if depth >= 0.5:
+                return "工作状态活跃，在多个任务间流转"
             return "注意力分散，建议整理任务清单"
 
         return None

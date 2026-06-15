@@ -256,24 +256,42 @@ def extract_text(image: "Image.Image") -> Optional[str]:
 class ScreenshotTrigger:
     """Decide whether to capture a screenshot based on current state and history."""
 
-    def __init__(self) -> None:
-        self._history: List[Tuple[datetime, str, str]] = []  # (time, app, title)
+    def __init__(
+        self,
+        enabled: bool = True,
+        blocklist_apps: Optional[List[str]] = None,
+    ) -> None:
+        self.enabled = enabled
+        self.blocklist_apps: Set[str] = set(
+            (a.lower() for a in (blocklist_apps or []))
+        )
+        self._history: List[Tuple[datetime, str, str]] = []  # (time, app, title) – capture history
+        self._state_history: List[Tuple[datetime, str, str]] = []  # (time, app, title) – per-minute state history
         self._last_capture_at: Optional[datetime] = None
 
     def should_capture(
         self,
         state,  # SemanticWorkState
         now: Optional[datetime] = None,
+        rule_skip_screenshot: bool = False,
     ) -> Tuple[bool, str]:
         """Return (should_capture, reason)."""
         if now is None:
             now = datetime.now(timezone.utc).astimezone()
+
+        if not self.enabled:
+            return False, "disabled"
+
+        if rule_skip_screenshot:
+            return False, "rule_skip"
 
         # Privacy: skip sensitive apps
         app_lower = state.current_app.lower()
         title_lower = state.current_title.lower()
         if app_lower in _SENSITIVE_APPS:
             return False, "sensitive_app"
+        if app_lower in self.blocklist_apps:
+            return False, "blocklist_app"
         for kw in _SENSITIVE_TITLE_KEYWORDS:
             if kw.lower() in title_lower:
                 return False, "sensitive_title"
@@ -315,12 +333,23 @@ class ScreenshotTrigger:
         cutoff = now - timedelta(days=1)
         self._history = [h for h in self._history if h[0] > cutoff]
 
+    def record_state(self, now: datetime, app: str, title: str) -> None:
+        """Record a per-minute state tick (independent of captures)."""
+        self._state_history.append((now, app, title))
+        # Prune old history (> 24h)
+        cutoff = now - timedelta(days=1)
+        self._state_history = [h for h in self._state_history if h[0] > cutoff]
+
     def _same_title_duration_min(self, now: datetime, title: str) -> int:
-        """How many minutes the same title has been seen continuously."""
-        if not self._history:
+        """How many minutes the same title has been seen continuously.
+
+        Uses per-minute state history rather than capture history so that
+        the trigger works even when no previous screenshots were taken.
+        """
+        if not self._state_history:
             return 0
         streak = 0
-        for t, _app, hist_title in reversed(self._history):
+        for t, _app, hist_title in reversed(self._state_history):
             if hist_title == title:
                 streak = int((now - t).total_seconds() / 60)
             else:
@@ -337,28 +366,32 @@ def capture_and_analyze(
     state,
     trigger: ScreenshotTrigger,
     previous_image: Optional["Image.Image"] = None,
-) -> Optional[ScreenshotAnalysisResult]:
+    rule_skip_screenshot: bool = False,
+) -> Tuple[Optional[ScreenshotAnalysisResult], Optional["Image.Image"]]:
     """One-shot: decide, capture, analyze, return result (or None if skipped).
 
     Args:
         state: SemanticWorkState
         trigger: ScreenshotTrigger instance (keeps history)
         previous_image: Previous screenshot for diff comparison
+        rule_skip_screenshot: Whether the matched rule requests skipping screenshots
 
     Returns:
-        ScreenshotAnalysisResult or None
+        Tuple of (ScreenshotAnalysisResult or None, captured Image or None)
     """
     now = datetime.now(timezone.utc).astimezone()
 
-    should, reason = trigger.should_capture(state, now)
+    should, reason = trigger.should_capture(
+        state, now, rule_skip_screenshot=rule_skip_screenshot
+    )
     if not should:
         logger.debug(f"Screenshot skipped: {reason}")
-        return None
+        return None, None
 
     img = capture_screen()
     if img is None:
         logger.warning("Screenshot capture failed")
-        return None
+        return None, None
 
     # Difference detection
     diff_ratio = 1.0
@@ -371,12 +404,13 @@ def capture_and_analyze(
     # Optional OCR
     ocr_text = extract_text(img)
 
-    # Discard image immediately (privacy)
-    del img
-
     trigger.record_capture(now, state.current_app, state.current_title)
 
-    return ScreenshotAnalysisResult(
+    # Privacy: discard full-resolution image; keep only a tiny grayscale
+    # thumbnail sufficient for frame-to-frame diff in the next tick.
+    diff_reference = _resize_for_comparison(img)
+
+    result = ScreenshotAnalysisResult(
         captured_at=now,
         app=state.current_app,
         title=state.current_title,
@@ -386,3 +420,4 @@ def capture_and_analyze(
         ocr_text=ocr_text,
         trigger_reason=reason,
     )
+    return result, diff_reference

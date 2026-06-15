@@ -489,6 +489,15 @@ def _render_semantic_state(state_obj, chain_result, context_stack=None, screensh
         else state_obj.current_title
     )
     click.echo(f"│  标题:      {title:<30} │")
+    if state_obj.task_label:
+        click.echo(f"│  当前任务:  {state_obj.task_label:<30} │")
+    if state_obj.task_id:
+        tid = (
+            state_obj.task_id[:28] + "…"
+            if len(state_obj.task_id) > 29
+            else state_obj.task_id
+        )
+        click.echo(f"│  任务ID:    {tid:<30} │")
     if state_obj.semantic_project:
         click.echo(f"│  项目:      {state_obj.semantic_project:<30} │")
     if state_obj.semantic_filename:
@@ -672,36 +681,51 @@ def report(full: bool, dry_run: bool, date: str) -> None:
     # Decide whether AI suggestions are requested.
     use_ai = full and not dry_run and config.ai.backend != "rule_only"
 
-    # Phase 1: compute semantic project breakdown
+    # Task/project breakdown
     project_breakdown = None
+    inbox_items = None
     try:
-        from collections import defaultdict
+        from aw_coach.storage import Storage
 
-        from aw_coach.collector import DataCollector
-        from aw_coach.context_parser import TitleParser
+        storage = Storage(config.db_path)
+        inbox_items = storage.get_inbox_items(dismissed=False, limit=10)
+        task_rows = storage.get_task_daily_summary(target.isoformat())
+        if task_rows:
+            project_breakdown = {
+                row["label"]: row["total_sec"] / 3600 for row in task_rows
+            }
+        else:
+            from collections import defaultdict
 
-        collector = DataCollector()
-        start = datetime.combine(target, datetime.min.time())
-        end = datetime.combine(target, datetime.max.time())
-        if target == date_type.today():
-            end = datetime.now()
-        slices = collector.fetch_range(start, end)
-        parser = TitleParser()
-        proj_dur = defaultdict(float)
-        for s in slices:
-            if s.is_afk:
-                continue
-            ctx = parser.parse(s.primary_app, s.primary_title, s.web_url)
-            if ctx.project:
-                proj_dur[ctx.project] += s.duration / 3600
-        if proj_dur:
-            project_breakdown = dict(proj_dur)
+            from aw_coach.collector import DataCollector
+            from aw_coach.context_parser import TitleParser
+
+            collector = DataCollector()
+            start = datetime.combine(target, datetime.min.time())
+            end = datetime.combine(target, datetime.max.time())
+            if target == date_type.today():
+                end = datetime.now()
+            slices = collector.fetch_range(start, end)
+            parser = TitleParser()
+            proj_dur = defaultdict(float)
+            for s in slices:
+                if s.is_afk:
+                    continue
+                ctx = parser.parse(s.primary_app, s.primary_title, s.web_url)
+                if ctx.project:
+                    proj_dur[ctx.project] += s.duration / 3600
+            if proj_dur:
+                project_breakdown = dict(proj_dur)
     except Exception:
-        pass
+        logger.debug("Project breakdown failed", exc_info=True)
 
     reporter = ReportGenerator(config)
     report_text = reporter.generate_daily(
-        target, analysis, use_ai=use_ai, project_breakdown=project_breakdown
+        target,
+        analysis,
+        use_ai=use_ai,
+        project_breakdown=project_breakdown,
+        inbox_items=inbox_items,
     )
 
     if dry_run and config.ai.backend != "rule_only":
@@ -1532,3 +1556,151 @@ def reclassify(from_date: str, to_date: Optional[str]) -> None:
 
     click.echo(f"\n✅ Reclassified {total_days} day(s), {total_slices} slices total.")
     click.echo("Reports updated in ~/.local/share/activitywatch/aw-watcher-ai-coach/reports/daily/")
+
+
+@main.group()
+def inbox() -> None:
+    """View and manage agent inbox items."""
+
+
+@inbox.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Include dismissed items")
+@click.option("--limit", default=20, show_default=True)
+def inbox_list(show_all: bool, limit: int) -> None:
+    """List inbox messages from the background agent."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    storage = Storage(config.db_path)
+    if show_all:
+        open_items = storage.get_inbox_items(dismissed=False, limit=limit)
+        done_items = storage.get_inbox_items(dismissed=True, limit=limit)
+        items = sorted(open_items + done_items, key=lambda x: x["timestamp"], reverse=True)[:limit]
+    else:
+        items = storage.get_inbox_items(dismissed=False, limit=limit)
+
+    if not items:
+        click.echo("Inbox 为空。")
+        return
+
+    for item in items:
+        status = "dismissed" if item.get("dismissed") else "open"
+        click.echo(
+            f"[{item['id']}] {item['timestamp']} | {item['signal_type']} "
+            f"| sev={item['severity']:.1f} | {status}"
+        )
+        if item.get("evidence"):
+            click.echo(f"    {item['evidence']}")
+        if item.get("reason"):
+            click.echo(f"    ({item['reason']})")
+
+
+@inbox.command("dismiss")
+@click.argument("item_id", type=int)
+def inbox_dismiss(item_id: int) -> None:
+    """Dismiss an inbox item by id."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    storage = Storage(config.db_path)
+    item = storage.get_inbox_item(item_id)
+    if item is None:
+        raise click.ClickException(f"Inbox item {item_id} not found")
+    storage.dismiss_inbox_item(item_id)
+    click.echo(f"已忽略 inbox #{item_id}")
+
+
+@inbox.command("accept")
+@click.argument("item_id", type=int)
+def inbox_accept(item_id: int) -> None:
+    """Acknowledge an inbox item (dismiss after logging)."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    storage = Storage(config.db_path)
+    item = storage.get_inbox_item(item_id)
+    if item is None:
+        raise click.ClickException(f"Inbox item {item_id} not found")
+    storage.dismiss_inbox_item(item_id)
+    click.echo(f"已确认 inbox #{item_id}: {item.get('evidence', '')}")
+
+
+@main.group()
+def task() -> None:
+    """Task perception: list, confirm, and set daily goals."""
+
+
+@task.command("list")
+@click.option("--date", "target_date", default="today")
+def task_list(target_date: str) -> None:
+    """List task sessions for a day."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(target_date)
+    storage = Storage(config.db_path)
+    rows = storage.get_task_daily_summary(target.isoformat())
+    if not rows:
+        click.echo(f"{target.isoformat()} 暂无任务汇总。")
+        return
+    click.echo(f"任务分布 — {target.isoformat()}")
+    for row in rows:
+        hours = row["total_sec"] / 3600
+        click.echo(f"  {row['label']:<28} {hours:>5.1f}h  ({row['task_id']})")
+
+
+@task.command("confirm")
+@click.option("--label", default=None, help="Override task label")
+def task_confirm(label: Optional[str]) -> None:
+    """Confirm the current task from live semantic state."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    storage = Storage(config.db_path)
+    raw = storage.get_scheduler_state("semantic_state")
+    if not raw:
+        raise click.ClickException("无实时语义状态。请先运行 aw-coach-daemon。")
+    payload = json.loads(raw)
+    state = payload.get("state", {})
+    task_id = state.get("task_id") or "user:confirmed"
+    task_label = label or state.get("task_label") or click.prompt("任务名称")
+    config.tasks.user_task_id = task_id
+    config.tasks.user_task_label = task_label
+    click.echo(f"已记录任务确认: {task_label} ({task_id})")
+    click.echo("提示: 持久化请写入 config: aw-coach config set tasks.user_task_label \"...\"")
+
+
+@task.command("set")
+@click.argument("goal")
+def task_set(goal: str) -> None:
+    """Set today's primary task goal (stored in config)."""
+    click.echo(f"今日目标: {goal}")
+    escaped = goal.replace('"', '\\"')
+    click.echo(f'请运行: aw-coach config set tasks.user_task_label "{escaped}"')
+
+
+@task.command("review")
+@click.option("--date", "target_date", default="today")
+@click.option("--sample", default=5, show_default=True)
+def task_review(target_date: str, sample: int) -> None:
+    """Sample task sessions for manual accuracy review."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(target_date)
+    storage = Storage(config.db_path)
+    sessions = storage.get_task_sessions_for_day(target.isoformat())
+    if not sessions:
+        click.echo("无可抽查的任务会话。")
+        return
+    import random
+
+    picked = random.sample(sessions, min(sample, len(sessions)))
+    correct = 0
+    for row in picked:
+        hours = row["accumulated_sec"] / 3600
+        click.echo(f"\n[{row['id']}] {row['label']} — {hours:.1f}h ({row['intent']})")
+        if click.confirm("归属是否正确?", default=True):
+            correct += 1
+    rate = correct / len(picked) * 100
+    click.echo(f"\n准确率抽样: {correct}/{len(picked)} ({rate:.0f}%)")

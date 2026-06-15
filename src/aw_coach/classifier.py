@@ -25,12 +25,39 @@ class RuleOnlyClassifier:
         ]
 
 
+class LLMOnlyClassifier:
+    """Pure LLM classification without rule engine."""
+
+    def __init__(self, llm_backend):
+        self.llm = llm_backend
+
+    def batch_classify(self, slices: List[ActivitySlice]):
+        if not slices:
+            return []
+        return self.llm.batch_classify(slices)
+
+
 def create_classifier(
     config: Config,
     on_hybrid_fallback: Optional[Callable[[Exception], None]] = None,
 ):
     """Create the configured classifier, falling back to rules if hybrid cannot start."""
     rule_engine = RuleEngine.with_all_rules()
+
+    if config.ai.backend == "openai":
+        if not config.ai.openai.api_key:
+            raise ValueError(
+                "ai.backend=openai requires ai.openai.api_key. "
+                "Set it in config or use ${ENV_VAR}."
+            )
+        from aw_coach.ai.openai_backend import OpenAIBackend
+
+        llm = OpenAIBackend(
+            api_key=config.ai.openai.api_key,
+            model=config.ai.openai.model,
+            base_url=config.ai.openai.base_url,
+        )
+        return LLMOnlyClassifier(llm)
 
     if config.ai.backend == "hybrid":
         try:

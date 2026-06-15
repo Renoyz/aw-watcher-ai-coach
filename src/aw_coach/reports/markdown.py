@@ -17,12 +17,28 @@ def _bar(value: float, max_value: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _energy_emoji(score: int) -> str:
+def _energy_emoji(score: int, median: Optional[float] = None) -> str:
+    if median is not None:
+        if score >= median + 10:
+            return "🟢"
+        if score <= median - 10:
+            return "🔴"
+        return "🟡"
     if score >= 70:
         return "🟢"
     if score >= 50:
         return "🟡"
     return "🔴"
+
+
+def _energy_trend(score: int, prev: Optional[int]) -> str:
+    if prev is None:
+        return ""
+    if score > prev:
+        return " ↑"
+    if score < prev:
+        return " ↓"
+    return " →"
 
 
 class ReportGenerator:
@@ -35,6 +51,7 @@ class ReportGenerator:
         analysis: AnalysisResult,
         use_ai: bool = False,
         project_breakdown: Optional[Dict[str, float]] = None,
+        inbox_items: Optional[List[dict]] = None,
     ) -> str:
         sections = [
             self._header(report_date),
@@ -47,6 +64,9 @@ class ReportGenerator:
             self._energy_curve(analysis),
             self._suggestions_section(analysis, use_ai=use_ai),
         ])
+        inbox_section = self._inbox_section(inbox_items)
+        if inbox_section:
+            sections.append(inbox_section)
         return "\n\n".join(sections)
 
     def generate_status(self, analysis: AnalysisResult) -> str:
@@ -84,12 +104,24 @@ class ReportGenerator:
     def _header(self, report_date: date) -> str:
         return f"# 工作效率日报 - {report_date.isoformat()}"
 
+    def _ai_collaboration_ratio(self, analysis: AnalysisResult) -> Optional[str]:
+        breakdown = analysis.activity_breakdown
+        ai_h = breakdown.get("ai_assisted", 0.0)
+        prog_h = breakdown.get("programming", 0.0)
+        total = ai_h + prog_h
+        if total <= 0:
+            return None
+        pct = ai_h / total * 100
+        return f"{pct:.0f}% ({ai_h:.1f}h / {total:.1f}h)"
+
     def _overview_table(self, analysis: AnalysisResult) -> str:
         productivity_line = (
             f"| 生产力得分 | {analysis.productivity_score}/100 |\n"
             if analysis.productivity_score > 0
             else ""
         )
+        ai_ratio = self._ai_collaboration_ratio(analysis)
+        ai_line = f"| AI 协作占比 | {ai_ratio} |\n" if ai_ratio else ""
         return f"""## 今日概览
 
 | 指标 | 数值 |
@@ -97,12 +129,12 @@ class ReportGenerator:
 | 有效工作时长 | {analysis.effective_hours:.1f}h |
 | 深度工作时长 | {analysis.deep_work_hours:.2f}h |
 | 专注得分 | {analysis.focus_score}/100 |
-{productivity_line}| 任务切换 | {analysis.switch_count} 次 |"""
+{productivity_line}{ai_line}| 任务切换 | {analysis.switch_count} 次 |"""
 
     def _project_breakdown_section(self, project_breakdown: Dict[str, float]) -> str:
         if not project_breakdown:
             return ""
-        lines = ["## 项目分布", ""]
+        lines = ["## 任务/项目分布", ""]
         max_hours = max(project_breakdown.values())
         for project, hours in sorted(project_breakdown.items(), key=lambda x: -x[1]):
             bar = _bar(hours, max_hours, 20)
@@ -128,11 +160,31 @@ class ReportGenerator:
         if not analysis.hourly_scores:
             return ""
 
-        lines = ["## 精力曲线", ""]
-        for hour, score in analysis.hourly_scores:
-            emoji = _energy_emoji(score)
-            lines.append(f"  {hour:02d}:00  {emoji} {score}")
+        scores = [s for _, s in analysis.hourly_scores]
+        median = float(sorted(scores)[len(scores) // 2])
 
+        lines = ["## 精力曲线", ""]
+        prev_score: Optional[int] = None
+        for hour, score in analysis.hourly_scores:
+            emoji = _energy_emoji(score, median=median)
+            trend = _energy_trend(score, prev_score)
+            lines.append(f"  {hour:02d}:00  {emoji} {score}{trend}")
+            prev_score = score
+
+        return "\n".join(lines)
+
+    def _inbox_section(self, inbox_items: Optional[List[dict]]) -> str:
+        if not inbox_items:
+            return ""
+        lines = ["## 待处理建议 (Inbox)", ""]
+        for item in inbox_items[:5]:
+            signal = item.get("signal_type", "signal")
+            evidence = item.get("evidence", "")
+            if len(evidence) > 60:
+                evidence = evidence[:57] + "..."
+            lines.append(f"- [{signal}] {evidence}")
+        lines.append("")
+        lines.append("运行 `aw-coach inbox list` 查看并处理。")
         return "\n".join(lines)
 
     def _suggestions_section(self, analysis: AnalysisResult, use_ai: bool = False) -> str:

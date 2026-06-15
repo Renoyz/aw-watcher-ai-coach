@@ -14,19 +14,34 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIBackend(AIBackend):
+    DEFAULT_TIMEOUT = 30.0
+    MAX_RETRIES = 1
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini", base_url: Optional[str] = None):
         import openai
-        kwargs = {"api_key": api_key}
+        kwargs = {"api_key": api_key, "timeout": self.DEFAULT_TIMEOUT}
         if base_url:
             kwargs["base_url"] = base_url
         self.client = openai.OpenAI(**kwargs)
         self.model = model
         self.last_usage: Optional[dict] = None
 
+    def chat_completion(self, **kwargs):
+        """Chat completion with one retry on transient failure."""
+        last_error = None
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                return self.client.chat.completions.create(model=self.model, **kwargs)
+            except Exception as e:
+                last_error = e
+                if attempt >= self.MAX_RETRIES:
+                    raise
+                logger.debug("LLM call failed, retrying", exc_info=True)
+        raise last_error  # type: ignore[misc]
+
     def batch_classify(self, slices: List[ActivitySlice]) -> List[ClassificationResult]:
         prompt = self._build_batch_prompt(slices)
-        response = self.client.chat.completions.create(
-            model=self.model,
+        response = self.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.1,

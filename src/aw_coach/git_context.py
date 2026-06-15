@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_GIT_CACHE: Dict[str, Tuple[float, Optional[Path], Optional["GitContext"]]] = {}
+_GIT_CACHE_TTL_SEC = 90.0
+
+
+def clear_git_context_cache() -> None:
+    """Clear project git lookup cache (useful in tests)."""
+    _GIT_CACHE.clear()
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,7 @@ def _candidate_paths_from_project_name(project: str) -> list[Path]:
 def get_git_context_for_project(
     project: str,
     extra_bases: Optional[list[str]] = None,
+    project_roots: Optional[list[str]] = None,
 ) -> Optional[GitContext]:
     """
     Heuristic: given a *project* name (from window title), try to find its git repo.
@@ -103,15 +113,39 @@ def get_git_context_for_project(
     Searches under ``~/projects/``, ``~/workspace/``, ``~/``, etc.
     Returns the first match that is a valid git repository.
     """
+    cache_key = (
+        f"{Path.home()}|{project}|{','.join(extra_bases or [])}|"
+        f"{','.join(project_roots or [])}"
+    )
+    now = time.monotonic()
+    cached = _GIT_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < _GIT_CACHE_TTL_SEC:
+        cached_path, cached_ctx = cached[1], cached[2]
+        if cached_path is not None and (cached_path / ".git").exists():
+            return cached_ctx
+
     candidates = _candidate_paths_from_project_name(project)
+    if project_roots:
+        home = Path.home()
+        for root in project_roots:
+            expanded = Path(root).expanduser()
+            if not expanded.is_absolute():
+                expanded = home / expanded
+            candidates.insert(0, expanded / project)
+            candidates.insert(0, expanded)
 
     if extra_bases:
         home = Path.home()
         for base in extra_bases:
             candidates.append(home / base / project)
 
+    result: Optional[GitContext] = None
+    matched_path: Optional[Path] = None
     for path in candidates:
         if (path / ".git").exists():
-            return get_git_context_from_path(path)
+            matched_path = path
+            result = get_git_context_from_path(path)
+            break
 
-    return None
+    _GIT_CACHE[cache_key] = (now, matched_path, result)
+    return result

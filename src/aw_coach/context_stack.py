@@ -29,16 +29,19 @@ from aw_coach.enriched_state import SemanticWorkState
 # A mode is considered "deep" if it represents focused work
 _DEEP_MODES = frozenset({
     "coding", "debugging", "testing", "writing", "researching",
-    "building", "editing", "reviewing", "committing",
+    "building", "editing", "reviewing", "committing", "ai_coding",
 })
 
 # Shallow modes that are likely interrupts
 _SHALLOW_MODES = frozenset({
-    "browsing", "chatting", "terminal", "meeting",
+    "browsing", "chatting", "meeting",
 })
 
 # How long a shallow mode must last before it's considered a real switch
 INTERRUPT_THRESHOLD_SEC = 180  # 3 minutes
+
+# Extended threshold for research-mode browsing (reading docs is deep work)
+RESEARCH_INTERRUPT_THRESHOLD_SEC = 300  # 5 minutes
 
 # How long outside primary context before we consider it a real switch
 SWITCH_THRESHOLD_SEC = 300  # 5 minutes
@@ -60,6 +63,7 @@ class ContextFrame:
     app: str
     title: str
     entered_at: datetime
+    task_id: Optional[str] = None
     accumulated_sec: float = 0.0
     is_active: bool = True
 
@@ -76,6 +80,7 @@ class ContextFrame:
             app=state.current_app,
             title=state.current_title,
             entered_at=state.updated_at,
+            task_id=state.task_id,
         )
 
 
@@ -160,8 +165,13 @@ class ContextStack:
         # How long have we been outside primary?
         away_sec = (now - self._left_primary_at).total_seconds()
 
+        # Determine dynamic interrupt threshold
+        interrupt_threshold = INTERRUPT_THRESHOLD_SEC
+        if state.likely_mode == "researching":
+            interrupt_threshold = RESEARCH_INTERRUPT_THRESHOLD_SEC
+
         # Case A: shallow interrupt that returned quickly
-        if away_sec < INTERRUPT_THRESHOLD_SEC:
+        if away_sec < interrupt_threshold:
             if state.likely_mode in _SHALLOW_MODES:
                 # Still an interrupt, do nothing
                 return
@@ -184,7 +194,8 @@ class ContextStack:
     @staticmethod
     def _is_same_context(state: SemanticWorkState, frame: ContextFrame) -> bool:
         """Check if state matches the given frame."""
-        # Same mode + same project (or both have no project)
+        if state.task_id and frame.task_id and state.task_id == frame.task_id:
+            return True
         same_mode = state.likely_mode == frame.mode
         same_project = state.semantic_project == frame.project
         return same_mode and same_project

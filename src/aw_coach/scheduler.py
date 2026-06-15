@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from aw_coach.analyzer import PatternAnalyzer
+from aw_coach.background_summary import generate_background_summary
 from aw_coach.classifier import create_classifier
 from aw_coach.collector import DataCollector, _local_to_utc
 from aw_coach.config import Config, load_config
+from aw_coach.notification_gate import NotificationGate
 from aw_coach.notify import send_notification
+from aw_coach.policy import ActionDecision, PolicyEngine
 from aw_coach.report import ReportGenerator, generate_html_dashboard
+from aw_coach.state import CoachAgentStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,32 @@ class CoachScheduler:
         # Change-only snapshot tracking
         self._last_snapshot_payload: Optional[Dict] = None
 
+        # Phase 2: policy engine for event-driven actions
+        self._policy_engine: Optional["PolicyEngine"] = None
+        self._notification_gate = NotificationGate.from_config(config)
+
+        # Phase 3: agent state machine
+        self._state_machine: Optional["CoachAgentStateMachine"] = None
+
+        # Cached rule engine (avoid reloading YAML every minute)
+        self._rule_engine = None
+
+        # Task perception
+        self._task_signal_extractor = None
+        self._task_fusion = None
+        self._task_tracker = None
+
+        # Background LLM summary worker
+        self._summary_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="aw-coach-summary"
+        )
+        self._summary_future = None
+        self._last_morning_brief_date: Optional[date] = None
+        self._semantic_payload: Optional[Dict] = None
+        from aw_coach.cron_runner import CronRunner
+
+        self._cron_runner = CronRunner.from_config(config.cron_jobs)
+
     @property
     def storage(self):
         if self._storage is None:
@@ -77,12 +109,12 @@ class CoachScheduler:
         try:
             from aw_coach.chain_analyzer import ChainAnalyzer
             from aw_coach.enriched_state import EnrichedStateAssembler
-            from aw_coach.rules.engine import RuleEngine
-
             if self._enricher is None:
                 self._enricher = EnrichedStateAssembler()
             if self._chain_analyzer is None:
                 self._chain_analyzer = ChainAnalyzer()
+
+            engine = self._get_rule_engine()
 
             start = now - timedelta(minutes=30)
             slices = [
@@ -97,7 +129,6 @@ class CoachScheduler:
             if _tz and now.tzinfo is None:
                 now = now.replace(tzinfo=_tz)
 
-            engine = RuleEngine.with_all_rules()
             latest = max(slices, key=lambda s: s.end)
             rule = engine.classify(
                 latest.primary_app, latest.primary_title, latest.web_url
@@ -128,6 +159,84 @@ class CoachScheduler:
                     1 for i in range(len(types) - 1) if types[i] != types[i + 1]
                 )
 
+            # --- Live process enrichment (only for the latest slice) ----
+            live_terminal_cmd: Optional[str] = None
+            if latest.primary_app.lower() in {
+                "terminal", "iterm2", "gnome-terminal", "konsole",
+                "alacritty", "wezterm", "warp", "tabby", "xterm",
+                "kitty", "windows terminal", "terminator", "tilix",
+                "hyper", "st",
+            }:
+                try:
+                    from aw_coach.process_context import get_terminal_foreground_command
+                    cmd = get_terminal_foreground_command()
+                    if cmd:
+                        live_terminal_cmd = cmd[0] if len(cmd) == 1 else f"{cmd[0]} {cmd[1]}"
+                except Exception:
+                    pass
+            # ---------------------------------------------------------------
+
+            # --- Preliminary state (for screenshot trigger decision) ------
+            prelim_state = self._enricher.assemble(
+                app=latest.primary_app,
+                title=latest.primary_title,
+                url=getattr(latest, "web_url", None),
+                active_block_minutes=block_sec // 60,
+                rule_activity=rule.activity_type,
+                switches_last_5min=switches,
+                terminal_command=live_terminal_cmd,
+            )
+
+            # --- Screenshot analysis (optional lightweight visual signal) ---
+            screenshot_result = None
+            try:
+                from aw_coach.screenshot import (
+                    ScreenshotTrigger,
+                    capture_and_analyze,
+                )
+
+                if self.config.screenshot.enabled:
+                    if self._screenshot_trigger is None:
+                        self._screenshot_trigger = ScreenshotTrigger(
+                            enabled=self.config.screenshot.enabled,
+                            blocklist_apps=self.config.screenshot.blocklist_apps,
+                        )
+                    # Feed per-minute state history for same-title trigger
+                    self._screenshot_trigger.record_state(
+                        now, latest.primary_app, latest.primary_title
+                    )
+                    screenshot_result, captured_img = capture_and_analyze(
+                        prelim_state,
+                        self._screenshot_trigger,
+                        self._last_screenshot_image,
+                        rule_skip_screenshot=getattr(rule, "skip_screenshot", False),
+                    )
+                    if captured_img is not None:
+                        self._last_screenshot_image = captured_img
+            except Exception:
+                logger.debug("Screenshot analysis failed", exc_info=True)
+            # ---------------------------------------------------------------
+
+            # --- Build history for detectors (last 9 *prior* slices) ----
+            # Exclude `latest` so detectors/chain don't see the current slice
+            # twice (once unrefined, once refined).
+            sorted_slices = sorted(slices, key=lambda s: s.end)
+            prior_slices = sorted_slices[:-1]  # drop latest
+            history_records = []
+            for s in prior_slices[-9:]:
+                sr = engine.classify(s.primary_app, s.primary_title, s.web_url)
+                history_records.append(
+                    self._enricher.assemble(
+                        app=s.primary_app,
+                        title=s.primary_title,
+                        url=getattr(s, "web_url", None),
+                        active_block_minutes=getattr(s, "duration", 60) // 60,
+                        rule_activity=sr.activity_type,
+                    )
+                )
+            # ---------------------------------------------------------------
+
+            # --- Final state (with OCR + live terminal + context stack) ---
             state = self._enricher.assemble(
                 app=latest.primary_app,
                 title=latest.primary_title,
@@ -135,6 +244,11 @@ class CoachScheduler:
                 active_block_minutes=block_sec // 60,
                 rule_activity=rule.activity_type,
                 switches_last_5min=switches,
+                terminal_command=live_terminal_cmd,
+                screen_ocr_text=screenshot_result.ocr_text if screenshot_result else None,
+                screen_diff_ratio=screenshot_result.diff_ratio if screenshot_result else None,
+                screen_content_type=screenshot_result.content_type if screenshot_result else None,
+                history=history_records,
             )
 
             # --- Context Stack update -------------------------------------
@@ -145,7 +259,6 @@ class CoachScheduler:
             # Override active_block_minutes with context-stack accumulated time
             cs_minutes = self._context_stack.get_active_block_minutes()
             if cs_minutes > 0:
-                # Re-assemble with corrected block time
                 state = self._enricher.assemble(
                     app=latest.primary_app,
                     title=latest.primary_title,
@@ -153,45 +266,25 @@ class CoachScheduler:
                     active_block_minutes=cs_minutes,
                     rule_activity=rule.activity_type,
                     switches_last_5min=switches,
+                    terminal_command=live_terminal_cmd,
+                    screen_ocr_text=screenshot_result.ocr_text if screenshot_result else None,
+                    screen_diff_ratio=screenshot_result.diff_ratio if screenshot_result else None,
+                    screen_content_type=(
+                        screenshot_result.content_type if screenshot_result else None
+                    ),
+                    history=history_records,
                 )
+                # Sync context stack with corrected block time
+                self._context_stack.update(state, now)
             # ---------------------------------------------------------------
 
-            # Chain analysis (last 10 slices)
-            chain_records = []
-            for s in sorted(slices, key=lambda s: s.end)[-10:]:
-                sr = engine.classify(s.primary_app, s.primary_title, s.web_url)
-                chain_records.append(
-                    self._enricher.assemble(
-                        app=s.primary_app,
-                        title=s.primary_title,
-                        url=getattr(s, "web_url", None),
-                        active_block_minutes=getattr(s, "duration", 60) // 60,
-                        rule_activity=sr.activity_type,
-                    )
-                )
+            # --- Chain analysis (build from final state) ------------------
+            chain_records = list(history_records)
+            # Append the final (refined) state so chain uses OCR-corrected mode
+            chain_records.append(state)
             chain = self._chain_analyzer.analyze(chain_records)
 
-            # --- Screenshot analysis (optional lightweight visual signal) ---
-            screenshot_result = None
-            try:
-                from aw_coach.screenshot import (
-                    ScreenshotTrigger,
-                    capture_and_analyze,
-                    capture_screen,
-                )
-
-                if self._screenshot_trigger is None:
-                    self._screenshot_trigger = ScreenshotTrigger()
-                screenshot_result = capture_and_analyze(
-                    state, self._screenshot_trigger, self._last_screenshot_image
-                )
-                if screenshot_result:
-                    self._last_screenshot_image = capture_screen()
-            except Exception:
-                logger.debug("Screenshot analysis failed", exc_info=True)
-            # ---------------------------------------------------------------
-
-            import json
+            state = self._apply_task_perception(state, rule, now)
 
             payload = {
                 "state": state.to_dict(),
@@ -212,6 +305,7 @@ class CoachScheduler:
                     "trigger_reason": screenshot_result.trigger_reason,
                 }
             self._semantic_state_json = json.dumps(payload, ensure_ascii=False)
+            self._semantic_payload = payload
             self.storage.set_scheduler_state("semantic_state", self._semantic_state_json)
 
             # Change-only snapshot: persist only when state meaningfully changes
@@ -230,6 +324,31 @@ class CoachScheduler:
                 except Exception:
                     logger.debug("State snapshot save failed", exc_info=True)
 
+            # Phase 2+3: state machine + policy-driven action from detected signals
+            self._notification_gate.reset_daily_if_needed(now)
+            sm = self._get_state_machine()
+            sm.auto_advance(now)
+            if state.agent_signal is not None:
+                sm.transition_to(sm.state, signal_type=state.agent_signal.signal_type)
+                policy = self._get_policy_engine()
+                gate_kwargs = self._notification_gate.blackboard_kwargs(now)
+                decision = policy.decide(
+                    signal_type=state.agent_signal.signal_type,
+                    severity=state.agent_signal.severity,
+                    evidence=self._format_signal_evidence(state),
+                    in_focus_block=state.detected_signal == "focused",
+                    focus_block_minutes=cs_minutes,
+                    **gate_kwargs,
+                )
+                self._apply_policy_decision(decision, state.agent_signal, now)
+            elif (
+                self.config.tasks.enabled
+                and state.task_confidence > 0
+                and state.task_confidence < 0.4
+            ):
+                self._maybe_queue_task_confirm_inbox(state, now)
+            self._persist_state_machine()
+
             interrupt = self._context_stack.get_interruption_summary()
             logger.debug(
                 f"Semantic state updated: mode={state.likely_mode}, "
@@ -240,6 +359,221 @@ class CoachScheduler:
             )
         except Exception:
             logger.debug("Semantic state update failed", exc_info=True)
+
+    def _get_state_machine(self) -> CoachAgentStateMachine:
+        if self._state_machine is None:
+            raw = self.storage.get_scheduler_state("agent_state")
+            if raw:
+                try:
+                    self._state_machine = CoachAgentStateMachine.from_json(raw)
+                except Exception:
+                    logger.debug("Failed to restore state machine, starting fresh")
+                    self._state_machine = CoachAgentStateMachine()
+            else:
+                self._state_machine = CoachAgentStateMachine()
+        return self._state_machine
+
+    def _persist_state_machine(self) -> None:
+        if self._state_machine is not None:
+            try:
+                self.storage.set_scheduler_state(
+                    "agent_state", self._state_machine.to_json()
+                )
+            except Exception:
+                logger.debug("State machine persist failed", exc_info=True)
+
+    def _get_rule_engine(self):
+        if self._rule_engine is None:
+            from aw_coach.rules.engine import RuleEngine
+
+            self._rule_engine = RuleEngine.with_all_rules()
+        return self._rule_engine
+
+    def _get_policy_engine(self) -> PolicyEngine:
+        if self._policy_engine is None:
+            self._policy_engine = PolicyEngine(
+                max_notifications_per_day=self.config.report.daily_notification_budget,
+                cooldown_seconds=self.config.report.notification_cooldown_seconds,
+            )
+        return self._policy_engine
+
+    def _apply_task_perception(self, state, rule, now: datetime):
+        if not self.config.tasks.enabled:
+            return state
+        from aw_coach.git_context import get_git_context_for_project
+        from aw_coach.task_fusion import TaskFusionEngine
+        from aw_coach.task_signals import TaskSignalExtractor
+        from aw_coach.task_tracker import TaskSessionTracker
+
+        if self._task_signal_extractor is None:
+            self._task_signal_extractor = TaskSignalExtractor(self.config.tasks)
+        if self._task_fusion is None:
+            self._task_fusion = TaskFusionEngine()
+        if self._task_tracker is None:
+            self._task_tracker = TaskSessionTracker()
+
+        git_ctx = None
+        if state.semantic_project:
+            try:
+                git_ctx = get_git_context_for_project(
+                    state.semantic_project,
+                    project_roots=self.config.tasks.project_roots or None,
+                )
+            except Exception:
+                logger.debug("Git context lookup failed", exc_info=True)
+
+        candidate = self._task_signal_extractor.extract(
+            app=state.current_app,
+            title=state.current_title,
+            url=state.current_url,
+            likely_mode=state.likely_mode,
+            activity_type=rule.activity_type,
+            git_ctx=git_ctx,
+            filename=state.semantic_filename,
+            project=state.semantic_project,
+        )
+        task = self._task_fusion.resolve(candidate)
+        self._task_tracker.update(task, state, now)
+
+        state.task_id = task.task_id
+        state.task_label = task.label
+        state.task_intent = task.intent
+        state.task_confidence = task.confidence
+        return state
+
+    @staticmethod
+    def _format_signal_evidence(state) -> str:
+        base = ""
+        if state.agent_signal is not None:
+            base = state.agent_signal.evidence
+        if state.task_label:
+            prefix = f"[{state.task_label}] "
+            if base and not base.startswith(prefix):
+                return prefix + base
+            if not base:
+                return prefix.strip()
+        return base
+
+    def _maybe_queue_task_confirm_inbox(self, state, now: datetime) -> None:
+        key = f"task_confirm:{state.task_id}"
+        elapsed = self._notification_gate.seconds_since(key, now)
+        if elapsed is not None and elapsed < 3600:
+            return
+        try:
+            self.storage.add_inbox_item(
+                signal_type="task_confirm",
+                severity=0.4,
+                evidence=f"无法确认当前任务：{state.task_label or state.task_id}",
+                reason="低置信度任务识别，请运行 aw-coach task confirm",
+            )
+            self._notification_gate.record_event(key, now)
+        except Exception:
+            logger.debug("Task confirm inbox failed", exc_info=True)
+
+    def _apply_policy_decision(self, decision: ActionDecision, signal, now: datetime) -> None:
+        """Execute the action chosen by the policy engine, respecting the state machine."""
+        sm = self._get_state_machine()
+
+        if decision.action == "log_only":
+            logger.debug(f"Policy: log_only | {decision.reason} | {signal.signal_type}")
+            sm.transition_to(sm.state, signal_type=signal.signal_type, action="log_only")
+            self._persist_state_machine()
+            return
+
+        if decision.action == "inbox":
+            if not sm.may_inbox(signal.signal_type):
+                logger.debug(
+                    f"State machine blocked inbox for {signal.signal_type} "
+                    f"(state={sm.state.name})"
+                )
+                return
+            logger.info(f"Policy: inbox | {decision.reason} | {signal.signal_type}")
+            try:
+                self.storage.add_inbox_item(
+                    signal_type=signal.signal_type,
+                    severity=signal.severity,
+                    evidence=decision.evidence or signal.evidence,
+                    reason=decision.reason,
+                )
+                sm.transition_to(sm.state, signal_type=signal.signal_type, action="inbox")
+            except Exception:
+                logger.debug("Inbox save failed", exc_info=True)
+            self._persist_state_machine()
+            return
+
+        if decision.action == "notify_now":
+            if not sm.may_notify(signal.signal_type):
+                logger.debug(
+                    f"State machine blocked notify for {signal.signal_type} "
+                    f"(state={sm.state.name})"
+                )
+                return
+            logger.info(f"Policy: notify_now | {decision.reason} | {signal.signal_type}")
+            try:
+                sm.transition_to(sm.state, signal_type=signal.signal_type, action="notify")
+                allowed, _reason = self._notification_gate.allow_notify(
+                    signal.signal_type, now=now
+                )
+                if allowed:
+                    send_notification(
+                        title=f"AI Coach · {signal.signal_type}",
+                        body=decision.evidence or signal.evidence,
+                    )
+                    self._notification_gate.record_notify(signal.signal_type, now)
+                else:
+                    self.storage.add_inbox_item(
+                        signal_type=signal.signal_type,
+                        severity=signal.severity,
+                        evidence=decision.evidence or signal.evidence,
+                        reason=f"通知被抑制: {_reason}",
+                    )
+                sm.record_notification()
+                sm.transition_to(sm.state, signal_type=signal.signal_type, action="await_feedback")
+            except Exception:
+                logger.debug("Notify failed", exc_info=True)
+            self._persist_state_machine()
+            return
+
+    def _deliver_summary(
+        self,
+        kind: str,
+        title: str,
+        body: str,
+        *,
+        now: datetime,
+        detail_url: Optional[str] = None,
+        prefer_notify: bool = True,
+    ) -> None:
+        """Deliver summary via notify or inbox using NotificationGate."""
+        self._save_summary_archive(kind, title, body, now)
+        if not self._should_notify():
+            return
+
+        allowed, reason = self._notification_gate.allow_notify(kind, now=now)
+        if prefer_notify and allowed:
+            send_notification(title, body, detail_url=detail_url)
+            self._notification_gate.record_notify(kind, now)
+            return
+
+        try:
+            self.storage.add_inbox_item(
+                signal_type=kind,
+                severity=0.5,
+                evidence=body,
+                reason=f"摘要存档（通知抑制: {reason}）",
+            )
+        except Exception:
+            logger.debug("Summary inbox save failed", exc_info=True)
+
+    def _save_summary_archive(self, kind: str, title: str, body: str, now: datetime) -> None:
+        try:
+            archive_dir = self.config.reports_dir / "summaries"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            stamp = now.strftime("%Y-%m-%d-%H%M")
+            path = archive_dir / f"{stamp}-{kind}.md"
+            path.write_text(f"# {title}\n\n{body}\n", encoding="utf-8")
+        except Exception:
+            logger.debug("Summary archive failed", exc_info=True)
 
     def _detect_change(self, prev: Optional[Dict], curr: Dict) -> Optional[str]:
         """Detect whether current state is meaningfully different from previous snapshot.
@@ -254,6 +588,8 @@ class CoachScheduler:
             return "mode_change"
         if ps.get("semantic_project") != cs.get("semantic_project"):
             return "project_change"
+        if ps.get("task_id") != cs.get("task_id"):
+            return "task_change"
         if ps.get("risk_level") != cs.get("risk_level"):
             return "risk_change"
         p_cs = prev.get("context_stack", {})
@@ -360,20 +696,43 @@ class CoachScheduler:
             # Instant summary
             interval = self.config.report.instant_summary_interval_hours
             if (now - last_summary).total_seconds() >= interval * 3600:
-                self._send_instant_summary(now)
+                try:
+                    self._send_instant_summary(now)
+                except Exception:
+                    logger.debug("Instant summary failed", exc_info=True)
                 last_summary = now
                 self._save_last_summary(last_summary)
 
-            # Daily report - check file to avoid duplicate on restart
+            # Daily report - scheduler_state marker (CLI manual report must not block)
             report_time = self.config.report.daily_report_time
             hour, minute = int(report_time.split(":")[0]), int(report_time.split(":")[1])
             if now.hour == hour and now.minute >= minute:
-                report_path = (
-                    self.config.reports_dir / "daily" / f"{now.date().isoformat()}.md"
-                )
-                if not report_path.exists():
-                    self._generate_daily_report(now.date())
+                if not self._daily_report_already_done(now.date()):
+                    try:
+                        if self._generate_daily_report(now.date()):
+                            self._mark_daily_report_done(now.date())
+                    except Exception:
+                        logger.debug("Daily report failed", exc_info=True)
 
+            # Morning brief
+            brief_time = self.config.report.morning_brief_time
+            bh, bm = int(brief_time.split(":")[0]), int(brief_time.split(":")[1])
+            if (
+                now.hour == bh
+                and now.minute >= bm
+                and self._last_morning_brief_date != now.date()
+            ):
+                try:
+                    self._send_morning_brief(now)
+                except Exception:
+                    logger.debug("Morning brief failed", exc_info=True)
+                self._last_morning_brief_date = now.date()
+
+            try:
+                self._poll_summary_future()
+            except Exception:
+                logger.debug("Summary poll failed", exc_info=True)
+            self._run_due_cron_jobs(now)
             time.sleep(60)
 
     @staticmethod
@@ -395,6 +754,10 @@ class CoachScheduler:
                 self._hourly_analyze(last_boundary, now)
         except Exception as e:
             logger.warning(f"Flush on shutdown failed (non-fatal): {e}")
+        try:
+            self._summary_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         self._running = False
 
     def _catch_up_hourly(self, last_hourly: datetime, now: datetime) -> datetime:
@@ -486,7 +849,28 @@ class CoachScheduler:
             logger.warning(f"Failed to write hourly event to bucket: {e}")
             return False
 
+        try:
+            self._persist_completed_sessions()
+        except Exception:
+            logger.debug("Hourly task session persist failed", exc_info=True)
+
         return True
+
+    def _daily_report_state_key(self, report_date: date) -> str:
+        return f"daily_report_done:{report_date.isoformat()}"
+
+    def _daily_report_already_done(self, report_date: date) -> bool:
+        return self.storage.get_scheduler_state(
+            self._daily_report_state_key(report_date)
+        ) == "1"
+
+    def _mark_daily_report_done(self, report_date: date) -> None:
+        try:
+            self.storage.set_scheduler_state(
+                self._daily_report_state_key(report_date), "1"
+            )
+        except Exception:
+            logger.debug("Failed to mark daily report done", exc_info=True)
 
     def _event_exists(self, event_type: str, period_start: datetime, period_end: datetime) -> bool:
         """Check whether an analysis event for the same period already exists."""
@@ -524,15 +908,130 @@ class CoachScheduler:
     def _should_notify(self) -> bool:
         return self.config.report.notification_method != "cli_only"
 
-    def _send_instant_summary(self, now: datetime) -> None:
-        if not self._should_notify():
+    def _build_rule_summary_body(self, analysis, interval: float) -> str:
+        top_activity = ""
+        if analysis.activity_breakdown:
+            top_activity = max(analysis.activity_breakdown, key=analysis.activity_breakdown.get)
+        body_lines = [
+            f"有效工作: {analysis.effective_hours:.1f}h | 专注度: {analysis.focus_score}/100",
+        ]
+        if analysis.death_loops:
+            body_lines.append(f"检测到 {len(analysis.death_loops)} 个切换循环")
+        if top_activity:
+            body_lines.append(f"主要活动: {top_activity}")
+        suggestions = self.reporter._generate_suggestions(analysis, is_weekly=False)
+        if suggestions:
+            body_lines.append(suggestions[0])
+        return "\n".join(body_lines)
+
+    def _get_cost_controller(self):
+        from aw_coach.ai.cost import CostController
+
+        return CostController(self.config.cost, self.storage)
+
+    def _get_task_sessions_for_summary(self) -> Optional[List]:
+        if self._task_tracker is None:
+            return None
+        sessions = []
+        current = self._task_tracker.current_session
+        if current is not None:
+            sessions.append(current)
+        sessions.extend(self._task_tracker.completed_sessions)
+        return sessions or None
+
+    def _submit_background_summary(
+        self,
+        analysis,
+        *,
+        kind: str,
+        title: str,
+        fallback_body: str,
+        now: datetime,
+        detail_url: Optional[str] = None,
+        active_signals: Optional[List[str]] = None,
+        silent_on_failure: bool = False,
+        prefer_notify_fallback: bool = True,
+    ) -> None:
+        if not self.config.report.background_ai_summary:
+            self._deliver_summary(
+                kind,
+                title,
+                fallback_body,
+                now=now,
+                detail_url=detail_url,
+                prefer_notify=prefer_notify_fallback,
+            )
             return
 
+        semantic = self._semantic_payload
+        corrections = self.storage.get_corrections_last_30_days()
+        cost = self._get_cost_controller()
+        task_sessions = self._get_task_sessions_for_summary()
+        config = self.config
+
+        def _work():
+            return generate_background_summary(
+                analysis,
+                config,
+                cost_controller=cost,
+                semantic_state=semantic,
+                corrections=corrections,
+                task_sessions=task_sessions,
+                active_signals=active_signals,
+            )
+
+        if self._summary_future is not None and not self._summary_future.done():
+            self._deliver_summary(
+                kind, title, fallback_body, now=now, detail_url=detail_url, prefer_notify=False
+            )
+            return
+
+        self._summary_future = self._summary_executor.submit(_work)
+        self._pending_summary_delivery = {
+            "kind": kind,
+            "title": title,
+            "fallback_body": fallback_body,
+            "now": now,
+            "detail_url": detail_url,
+            "silent": silent_on_failure,
+            "prefer_notify": prefer_notify_fallback,
+        }
+
+    def _poll_summary_future(self) -> None:
+        pending = getattr(self, "_pending_summary_delivery", None)
+        if self._summary_future is None or not self._summary_future.done():
+            return
+        try:
+            ai_text = self._summary_future.result()
+        except Exception:
+            logger.debug("Background summary future failed", exc_info=True)
+            ai_text = None
+        finally:
+            self._summary_future = None
+
+        if pending is None:
+            return
+        body = ai_text or pending["fallback_body"]
+        if ai_text is None and pending.get("silent"):
+            self._pending_summary_delivery = None
+            return
+        self._deliver_summary(
+            pending["kind"],
+            pending["title"],
+            body,
+            now=pending["now"],
+            detail_url=pending.get("detail_url"),
+            prefer_notify=ai_text is not None and pending.get("prefer_notify", True),
+        )
+        self._pending_summary_delivery = None
+
+    def _send_instant_summary(self, now: datetime) -> None:
         interval = self.config.report.instant_summary_interval_hours
         start = now - timedelta(hours=interval)
         try:
             slices = self.collector.fetch_range(start, now)
         except Exception:
+            logger.debug("Instant summary fetch failed", exc_info=True)
             return
 
         if not slices:
@@ -541,39 +1040,66 @@ class CoachScheduler:
         rules = self._classify_slices(slices)
         analysis = self.analyzer.analyze(slices, rules)
 
-        # Generate dashboard for click-to-open
         detail_url = None
         try:
             generate_html_dashboard(self.config, now.date(), analysis, slices, rules)
             detail_url = self.dashboard_url
         except Exception:
-            pass
+            logger.debug("Dashboard generation failed", exc_info=True)
 
-        top_activity = ""
-        if analysis.activity_breakdown:
-            top_activity = max(analysis.activity_breakdown, key=analysis.activity_breakdown.get)
+        from aw_coach.background_summary import should_silent_summary
 
-        # Build richer notification body
-        body_lines = [
-            f"有效工作: {analysis.effective_hours:.1f}h | 专注度: {analysis.focus_score}/100",
-        ]
-        if analysis.death_loops:
-            body_lines.append(f"⚠️ 检测到 {len(analysis.death_loops)} 个切换循环")
-        if top_activity:
-            body_lines.append(f"主要活动: {top_activity}")
+        active_signals = []
+        if self._semantic_payload:
+            sig = self._semantic_payload.get("state", {}).get("detected_signal")
+            if sig:
+                active_signals.append(sig)
 
-        suggestions = self.reporter._generate_suggestions(analysis, is_weekly=False)
-        if suggestions:
-            body_lines.append(f"💡 {suggestions[0]}")
+        silent = should_silent_summary(analysis, self.config, active_signals)
+        if silent and not self.config.report.background_ai_summary:
+            return
 
-        body = "\n".join(body_lines)
-        send_notification(
-            f"AI Coach 摘要 (过去{interval}h)",
-            body,
+        fallback = self._build_rule_summary_body(analysis, interval)
+        title = f"AI Coach 摘要 (过去{interval}h)"
+        self._submit_background_summary(
+            analysis,
+            kind="summary",
+            title=title,
+            fallback_body=fallback,
+            now=now,
             detail_url=detail_url,
+            active_signals=active_signals,
+            silent_on_failure=silent,
         )
 
-    def _generate_daily_report(self, report_date: date) -> None:
+    def _send_morning_brief(self, now: datetime) -> None:
+        # Morning brief is part of the background-summary feature; opt-in only
+        # so default upgrade does not introduce new notifications.
+        if not self.config.report.background_ai_summary:
+            return
+        yesterday = now.date() - timedelta(days=1)
+        start = datetime.combine(yesterday, datetime.min.time())
+        try:
+            slices = self.collector.fetch_range(start, now)
+        except Exception:
+            logger.debug("Morning brief fetch failed", exc_info=True)
+            return
+        if not slices:
+            return
+        rules = self._classify_slices(slices)
+        analysis = self.analyzer.analyze(slices, rules)
+        fallback = self._build_rule_summary_body(analysis, (now - start).total_seconds() / 3600)
+        self._submit_background_summary(
+            analysis,
+            kind="morning_brief",
+            title=f"AI Coach 早报 - {now.date().isoformat()}",
+            fallback_body=fallback,
+            now=now,
+            detail_url=self.dashboard_url,
+        )
+
+    def _generate_daily_report(self, report_date: date) -> bool:
+        """Generate the daily report; True on success (marks the day done)."""
         start = datetime.combine(report_date, datetime.min.time())
         end = datetime.combine(report_date, datetime.max.time())
 
@@ -581,14 +1107,45 @@ class CoachScheduler:
             slices = self.collector.fetch_range(start, end)
         except Exception as e:
             logger.error(f"Failed to generate daily report: {e}")
-            return
+            return False
 
         if not slices:
-            return
+            return False
 
         rules = self._classify_slices(slices)
         analysis = self.analyzer.analyze(slices, rules)
-        report_text = self.reporter.generate_daily(report_date, analysis)
+
+        use_ai = self.config.report.background_ai_summary and self.config.ai.backend != "rule_only"
+        # Flush/persist sessions first so today's breakdown includes them
+        self._persist_task_sessions_for_day(report_date)
+        task_breakdown = None
+        if self.config.tasks.enabled:
+            task_breakdown = {
+                row["label"]: row["total_sec"] / 3600
+                for row in self.storage.get_task_daily_summary(report_date.isoformat())
+            }
+        inbox_items = self.storage.get_inbox_items(dismissed=False, limit=10)
+        report_text = self.reporter.generate_daily(
+            report_date,
+            analysis,
+            use_ai=use_ai,
+            project_breakdown=task_breakdown,
+            inbox_items=inbox_items,
+        )
+
+        ai_summary = None
+        if use_ai:
+            cost = self._get_cost_controller()
+            ai_summary = generate_background_summary(
+                analysis,
+                self.config,
+                cost_controller=cost,
+                semantic_state=self._semantic_payload,
+                corrections=self.storage.get_corrections_last_30_days(),
+                task_sessions=self._get_task_sessions_for_summary(),
+            )
+            if ai_summary:
+                report_text += f"\n\n## AI 总结\n\n{ai_summary}\n"
 
         # Save report to file
         reports_dir = self.config.reports_dir / "daily"
@@ -627,15 +1184,91 @@ class CoachScheduler:
         except Exception:
             pass
 
-        # Send notification
-        if self._should_notify():
-            send_notification(
-                f"AI Coach 日报 - {report_date.isoformat()}",
-                f"有效工作 {analysis.effective_hours:.1f}h | "
-                f"专注度 {analysis.focus_score}/100 | "
-                f"深度工作 {analysis.deep_work_hours:.1f}h",
-                detail_url=detail_url,
+        notify_body = ai_summary or (
+            f"有效工作 {analysis.effective_hours:.1f}h | "
+            f"专注度 {analysis.focus_score}/100 | "
+            f"深度工作 {analysis.deep_work_hours:.1f}h"
+        )
+        self._deliver_summary(
+            "daily_report",
+            f"AI Coach 日报 - {report_date.isoformat()}",
+            notify_body,
+            now=datetime.now(),
+            detail_url=detail_url,
+            prefer_notify=False,
+        )
+        return True
+
+    def _run_due_cron_jobs(self, now: datetime) -> None:
+        for job in self._cron_runner.due_jobs(now):
+            try:
+                start = now - timedelta(hours=4)
+                slices = self.collector.fetch_range(start, now)
+                if not slices:
+                    self._cron_runner.mark_run(job, now)
+                    continue
+                rules = self._classify_slices(slices)
+                analysis = self.analyzer.analyze(slices, rules)
+                fallback = self._build_rule_summary_body(analysis, 4)
+                title = f"AI Coach · {job.template}"
+                prefer = job.delivery == "notification"
+                self._submit_background_summary(
+                    analysis,
+                    kind=f"cron:{job.template}",
+                    title=title,
+                    fallback_body=fallback,
+                    now=now,
+                    detail_url=self.dashboard_url,
+                    prefer_notify_fallback=prefer,
+                )
+                self._cron_runner.mark_run(job, now)
+            except Exception:
+                logger.debug("Cron job failed: %s", job.template, exc_info=True)
+
+    def _persist_completed_sessions(self) -> None:
+        """Persist drained completed sessions without flushing the active one."""
+        if not self.config.tasks.enabled or self._task_tracker is None:
+            return
+        totals: Dict[tuple, Dict] = {}
+        for session in self._task_tracker.drain_completed():
+            try:
+                self.storage.save_task_session(
+                    task_id=session.task_id,
+                    label=session.label,
+                    project=session.project,
+                    intent=session.intent,
+                    started_at=session.started_at.isoformat(),
+                    ended_at=session.ended_at.isoformat() if session.ended_at else None,
+                    accumulated_sec=session.accumulated_sec,
+                    modes=session.modes,
+                    blockers=session.blockers,
+                    outcome=session.outcome,
+                    confidence=session.confidence,
+                )
+            except Exception:
+                logger.debug("Task session persist failed", exc_info=True)
+            day = session.started_at.date().isoformat()
+            entry = totals.setdefault(
+                (day, session.task_id),
+                {"label": session.label, "total_sec": 0.0},
             )
+            entry["total_sec"] += session.accumulated_sec
+        for (day, task_id), entry in totals.items():
+            try:
+                self.storage.upsert_task_daily_summary(
+                    day,
+                    task_id,
+                    entry["label"],
+                    entry["total_sec"],
+                )
+            except Exception:
+                logger.debug("Task daily summary persist failed", exc_info=True)
+
+    def _persist_task_sessions_for_day(self, report_date: date) -> None:
+        if not self.config.tasks.enabled or self._task_tracker is None:
+            return
+        self._task_tracker.flush(datetime.now())
+        self._persist_completed_sessions()
 
 
 def run_scheduler(dashboard_url: Optional[str] = None) -> None:

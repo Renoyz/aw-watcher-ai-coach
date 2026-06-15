@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -35,10 +35,37 @@ class AnalysisConfig(BaseModel):
     restrict_to_work_schedule: bool = False
 
 
+class PolicyConfig(BaseModel):
+    quiet_hours_enabled: bool = True
+    quiet_hours_start: str = "22:00"
+    quiet_hours_end: str = "08:00"
+
+
 class ReportConfig(BaseModel):
     daily_report_time: str = "21:00"
-    instant_summary_interval_hours: int = 1
+    morning_brief_time: str = "09:00"
+    instant_summary_interval_hours: int = 2
     notification_method: str = "both"
+    daily_notification_budget: int = 4
+    notification_cooldown_seconds: int = 600
+    background_ai_summary: bool = False
+    silent_if_effective_hours_below: float = 0.5
+    always_notify_signals: List[str] = ["stuck", "search_loop", "death_loop"]
+
+
+class TasksConfig(BaseModel):
+    enabled: bool = True
+    project_roots: List[str] = []
+    aliases: Dict[str, str] = {}
+    branch_patterns: List[str] = ["feat/*", "fix/*", "issue-*"]
+    user_task_label: str = ""
+    user_task_id: str = ""
+
+
+class CronJobConfig(BaseModel):
+    schedule: str = "every 4h"
+    template: str = "work_progress"
+    delivery: str = "inbox"
 
 
 class OpenAIConfig(BaseModel):
@@ -77,7 +104,7 @@ class CostConfig(BaseModel):
 
 
 class ScreenshotConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     retention_hours: int = 0
     blocklist_apps: List[str] = ["1password", "keepass", "bank", "password"]
 
@@ -85,6 +112,9 @@ class ScreenshotConfig(BaseModel):
 class Config(BaseModel):
     analysis: AnalysisConfig = AnalysisConfig()
     report: ReportConfig = ReportConfig()
+    policy: PolicyConfig = PolicyConfig()
+    tasks: TasksConfig = TasksConfig()
+    cron_jobs: List["CronJobConfig"] = []
     ai: AIConfig = AIConfig()
     cost: CostConfig = CostConfig()
     screenshot: ScreenshotConfig = ScreenshotConfig()

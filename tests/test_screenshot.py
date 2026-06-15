@@ -5,7 +5,7 @@ These tests mock image capture to avoid actually taking screenshots.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from aw_coach.screenshot import (
@@ -164,8 +164,9 @@ class TestCaptureAndAnalyze:
         )
         trigger = ScreenshotTrigger()
 
-        result = capture_and_analyze(state, trigger)
+        result, img = capture_and_analyze(state, trigger)
         assert result is not None
+        assert img is not None
         assert result.diff_ratio == 1.0  # no previous image
         assert result.content_type == "major_change"
         assert result.ocr_text is None  # tesseract unavailable
@@ -187,5 +188,101 @@ class TestCaptureAndAnalyze:
         )
         trigger = ScreenshotTrigger()
 
-        result = capture_and_analyze(state, trigger)
+        result, img = capture_and_analyze(state, trigger)
         assert result is None
+        assert img is None
+
+
+class TestScreenshotConfig:
+    def test_disabled_config(self):
+        from aw_coach.enriched_state import SemanticWorkState
+
+        state = SemanticWorkState(
+            updated_at=datetime.now(timezone.utc).astimezone(),
+            current_app="Code",
+            current_title="test",
+            likely_mode="unknown",
+            risk_level="normal",
+            active_block_minutes=15,
+        )
+        trigger = ScreenshotTrigger(enabled=False)
+        should, reason = trigger.should_capture(state)
+        assert not should
+        assert reason == "disabled"
+
+    def test_blocklist_app(self):
+        from aw_coach.enriched_state import SemanticWorkState
+
+        state = SemanticWorkState(
+            updated_at=datetime.now(timezone.utc).astimezone(),
+            current_app="1Password",
+            current_title="vault",
+            likely_mode="unknown",
+            risk_level="normal",
+            active_block_minutes=15,
+        )
+        trigger = ScreenshotTrigger(blocklist_apps=["1password", "keepass"])
+        should, reason = trigger.should_capture(state)
+        assert not should
+        assert reason == "blocklist_app"
+
+    def test_rule_skip_screenshot(self):
+        from aw_coach.enriched_state import SemanticWorkState
+
+        state = SemanticWorkState(
+            updated_at=datetime.now(timezone.utc).astimezone(),
+            current_app="1Password",
+            current_title="vault",
+            likely_mode="unknown",
+            risk_level="normal",
+            active_block_minutes=15,
+        )
+        trigger = ScreenshotTrigger()
+        should, reason = trigger.should_capture(state, rule_skip_screenshot=True)
+        assert not should
+        assert reason == "rule_skip"
+
+    def test_same_title_uses_state_history(self):
+        from aw_coach.enriched_state import SemanticWorkState
+
+        trigger = ScreenshotTrigger()
+        now = datetime.now(timezone.utc).astimezone()
+        # Feed 35 minutes of same-title state history without any captures
+        for i in range(35):
+            t = now - timedelta(minutes=34 - i)
+            trigger.record_state(t, "Chrome", "GitHub")
+        state = SemanticWorkState(
+            updated_at=now,
+            current_app="Chrome",
+            current_title="GitHub",
+            likely_mode="coding",
+            risk_level="normal",
+            active_block_minutes=5,
+        )
+        should, reason = trigger.should_capture(state)
+        assert should
+        assert "same_title" in reason
+
+    def test_no_double_capture(self):
+        from unittest.mock import patch, MagicMock
+        from aw_coach.enriched_state import SemanticWorkState
+
+        state = SemanticWorkState(
+            updated_at=datetime.now(timezone.utc).astimezone(),
+            current_app="Code",
+            current_title="test",
+            likely_mode="unknown",
+            risk_level="normal",
+            active_block_minutes=15,
+        )
+        trigger = ScreenshotTrigger()
+        mock_img = MagicMock()
+        with patch("aw_coach.screenshot.capture_screen") as mock_capture:
+            mock_capture.return_value = mock_img
+            result, img = capture_and_analyze(state, trigger)
+            assert result is not None
+            # Privacy: returned image is a downsampled diff reference,
+            # not the original full-resolution capture
+            assert img is not None
+            # capture_screen should be called exactly once inside capture_and_analyze
+            assert mock_capture.call_count == 1

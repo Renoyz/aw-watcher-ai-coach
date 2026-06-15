@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+import socket
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 
@@ -19,6 +20,7 @@ class WindowContext:
     language: Optional[str] = None
     site: Optional[str] = None
     action_hint: Optional[str] = None
+    remote_host: Optional[str] = None
 
 
 class TitleParser:
@@ -179,7 +181,12 @@ class TitleParser:
         language = self._detect_language(filename)
 
         # 2. Extract project name
-        project = self._extract_project(title, url)
+        project = self._extract_project(title, url, app=app)
+        remote_host = None
+        if not self._is_browser(app):
+            prompt = self._parse_terminal_prompt(title)
+            if prompt is not None:
+                remote_host = prompt[1]
 
         # 3. Detect site (browser)
         site = None
@@ -197,6 +204,7 @@ class TitleParser:
         object.__setattr__(ctx, "project", project)
         object.__setattr__(ctx, "site", site)
         object.__setattr__(ctx, "action_hint", action)
+        object.__setattr__(ctx, "remote_host", remote_host)
 
         return ctx
 
@@ -240,18 +248,93 @@ class TitleParser:
         re.IGNORECASE,
     )
 
+    # Terminal command prefixes: when title starts with these, it's a command line,
+    # not a "file - project" pattern. Skip naive split to avoid interpreting flags
+    # (e.g. "git commit -am 'wip'", "pytest -v") as project names.
+    _TERMINAL_PROMPT = re.compile(r"^(\w[\w.-]*)@([\w.-]+):\s*(.*)$")
+
+    _BROWSER_TITLE_SUFFIXES = re.compile(
+        r"\s+[-—|·•]\s*(?:Mozilla Firefox|Google Chrome|Chromium|Microsoft Edge|"
+        r"Safari|Brave|Arc|Vivaldi|Opera|LibreWolf)$",
+        re.IGNORECASE,
+    )
+
+    _TERMINAL_COMMAND_PREFIXES = frozenset({
+        "git ", "pytest", "cargo ", "npm ", "yarn ", "pnpm ", "docker ", "kubectl ",
+        "make", "cmake", "python ", "python3 ", "node ", "ruby ", "go ", "rust ",
+        "java ", "javac ", "gcc ", "g++ ", "clang ", "bash ", "sh ", "zsh ",
+        "ssh ", "scp ", "rsync ", "tar ", "zip ", "unzip ", "curl ", "wget ",
+        "ls ", "cd ", "cat ", "less ", "more ", "tail ", "head ", "grep ",
+        "find ", "awk ", "sed ", "sort ", "uniq ", "diff ", "patch ", "vim ",
+        "nvim ", "emacs ", "nano ", "code ", "htop", "top", "ps ", "kill ",
+    })
+
     @classmethod
-    def _extract_project(cls, title: str, url: Optional[str]) -> Optional[str]:
-        """Try to find a project name from title or URL."""
-        # Strategy A (most reliable for browsers): extract from URL path
-        if url:
-            parsed = urlparse(url)
-            path = parsed.path.strip("/")
-            if parsed.netloc.lower() in ("github.com", "gitlab.com", "bitbucket.org"):
-                segments = path.split("/")
-                if len(segments) >= 2:
-                    return segments[1]
+    def _parse_terminal_prompt(cls, title: str) -> Optional[Tuple[str, str, str]]:
+        """Return (user, host, cwd) from SSH/terminal prompt titles."""
+        match = cls._TERMINAL_PROMPT.match(title.strip())
+        if not match:
             return None
+        return match.group(1), match.group(2), match.group(3).strip()
+
+    @classmethod
+    def _cwd_to_dir(cls, cwd: str) -> Optional[str]:
+        """Last path component from a terminal cwd; None for home-only."""
+        cwd = cwd.strip()
+        if not cwd or cwd in ("~", "~ "):
+            return None
+        if cwd.startswith("~"):
+            cwd = cwd[1:].lstrip("/\\")
+        cwd = cwd.replace("\\", "/").strip("/")
+        if not cwd:
+            return None
+        return cwd.rsplit("/", 1)[-1]
+
+    @classmethod
+    def _project_from_terminal_prompt(cls, title: str) -> Optional[str]:
+        parsed = cls._parse_terminal_prompt(title)
+        if parsed is None:
+            return None
+        _user, host, cwd = parsed
+        dir_name = cls._cwd_to_dir(cwd)
+        if not dir_name:
+            return None
+        local_host = socket.gethostname().lower()
+        host_lower = host.lower()
+        if host_lower != local_host and not local_host.startswith(host_lower):
+            return f"{dir_name}@{host}"
+        return dir_name
+
+    @classmethod
+    def _url_to_project(cls, url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+        if parsed.netloc.lower() in ("github.com", "gitlab.com", "bitbucket.org"):
+            segments = path.split("/")
+            if len(segments) >= 2:
+                return segments[1]
+        return None
+
+    @classmethod
+    def _extract_project(cls, title: str, url: Optional[str], app: str = "") -> Optional[str]:
+        """Try to find a project name from title or URL."""
+        # Strategy A (browsers): extract from URL path only.
+        # Checked first so webmail-like titles (user@mail.com: subject)
+        # never reach the terminal-prompt strategy.
+        if cls._is_browser(app):
+            if url:
+                return cls._url_to_project(url)
+            return None
+
+        # Strategy 0: SSH/terminal prompt (user@host: cwd)
+        prompt_project = cls._project_from_terminal_prompt(title)
+        if prompt_project is not None:
+            return prompt_project
+        if cls._parse_terminal_prompt(title) is not None:
+            return None
+
+        if url:
+            return cls._url_to_project(url)
 
         # Strategy B: strip known IDE/app suffixes, then take the last segment
         stripped = cls._IDE_SUFFIXES.sub("", title).strip()
@@ -270,8 +353,11 @@ class TitleParser:
 
         # Strategy C: terminal path → last directory name
         # e.g. ~/projects/x_system  or  ~/ros2_ws/src/x_system
-        # Only if title actually looks like a path (contains / or ~ or \)
-        if "/" in title or "~" in title or title.startswith("\\"):
+        # Skip user@host: prompts (handled above); require path-like titles
+        if (
+            cls._parse_terminal_prompt(title) is None
+            and ("/" in title or "~" in title or title.startswith("\\"))
+        ):
             path_match = re.search(r"(?:^|/)([^/]+)$", title.strip())
             if path_match:
                 candidate = path_match.group(1).strip()
@@ -279,6 +365,14 @@ class TitleParser:
                     # Make sure it doesn't look like a file with extension
                     if "." not in candidate or len(candidate.rsplit(".", 1)[-1]) > 6:
                         return candidate
+
+        # Strategy C+: terminal command → skip project extraction
+        # Command lines like "git commit -am 'wip'" or "pytest -v" should not
+        # be split naively; the flags are not project names.
+        title_stripped = title.strip()
+        lower_title = title_stripped.lower()
+        if any(lower_title.startswith(prefix) for prefix in cls._TERMINAL_COMMAND_PREFIXES):
+            return None
 
         # Strategy D: fallback to naive split
         parts = cls._IDE_SEPARATORS.split(title)
@@ -374,6 +468,7 @@ class TitleParser:
     def _is_noise_word(cls, word: str) -> bool:
         """Return True if the word is a generic UI label, not a project name."""
         noise = {
+            # IDE / Browser labels
             "visual studio code",
             "vscode",
             "code",
@@ -398,9 +493,14 @@ class TitleParser:
             "chrome",
             "chromium",
             "firefox",
+            "mozilla firefox",
+            "google chrome",
             "safari",
             "edge",
             "brave",
+            "obsidian",
+            "桌面",
+            "kimi",
             "github",
             "gitlab",
             "bitbucket",
@@ -422,5 +522,22 @@ class TitleParser:
             "历史",
             "bookmarks",
             "书签",
+            # Common short command-line flags / arguments that should never be project names
+            "v", "vv", "vvv",
+            "am", "m", "a", "f", "force",
+            "h", "help",
+            "q", "quiet",
+            "n", "dry-run",
+            "i", "interactive",
+            "r", "recursive",
+            "p", "port",
+            "u", "user",
+            "b", "branch",
+            "o", "output",
+            "e", "env",
+            "s", "server",
+            "d", "dev",
+            "t", "tag",
+            "y", "yes",
         }
         return word.lower().strip() in noise
