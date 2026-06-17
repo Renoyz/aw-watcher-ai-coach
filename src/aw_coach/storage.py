@@ -8,6 +8,8 @@ from os import PathLike
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from aw_coach.time_utils import now_local_iso
+
 
 class Storage:
     def __init__(self, db_path: Path):
@@ -136,6 +138,24 @@ class Storage:
                     PRIMARY KEY (date, task_id)
                 );
                 PRAGMA user_version = 6;
+            """)
+
+        if version < 7:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS delivery_log (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_delivery_log_time
+                    ON delivery_log(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_delivery_log_kind
+                    ON delivery_log(kind, status);
+                PRAGMA user_version = 7;
             """)
 
         self._conn.commit()
@@ -314,8 +334,8 @@ class Storage:
     ) -> int:
         cursor = self._conn.execute(
             "INSERT INTO inbox (timestamp, signal_type, severity, evidence, reason) "
-            "VALUES (datetime('now'), ?, ?, ?, ?)",
-            (signal_type, severity, evidence, reason),
+            "VALUES (?, ?, ?, ?, ?)",
+            (now_local_iso(), signal_type, severity, evidence, reason),
         )
         self._conn.commit()
         return cursor.lastrowid
@@ -323,7 +343,7 @@ class Storage:
     def get_inbox_items(self, dismissed: bool = False, limit: int = 50) -> List[Dict]:
         rows = self._conn.execute(
             "SELECT id, timestamp, signal_type, severity, evidence, reason, dismissed "
-            "FROM inbox WHERE dismissed = ? ORDER BY timestamp DESC LIMIT ?",
+            "FROM inbox WHERE dismissed = ? ORDER BY id DESC LIMIT ?",
             (1 if dismissed else 0, limit),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -339,6 +359,41 @@ class Storage:
             "SELECT id, timestamp, signal_type, severity, evidence, reason, dismissed "
             "FROM inbox WHERE id = ?",
             (item_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    # === Delivery Log ===
+
+    def record_delivery(
+        self,
+        kind: str,
+        channel: str,
+        status: str,
+        reason: str = "",
+        title: str = "",
+    ) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO delivery_log "
+            "(timestamp, kind, channel, status, reason, title) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now_local_iso(), kind, channel, status, reason, title),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def get_recent_delivery_logs(self, limit: int = 10) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT id, timestamp, kind, channel, status, reason, title "
+            "FROM delivery_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_delivery_issue(self) -> Optional[Dict]:
+        row = self._conn.execute(
+            "SELECT id, timestamp, kind, channel, status, reason, title "
+            "FROM delivery_log WHERE status IN ('failed', 'suppressed') "
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 

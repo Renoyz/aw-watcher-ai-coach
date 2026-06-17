@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 import sys
 from datetime import date as date_type
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ import click
 
 from aw_coach import __version__
 from aw_coach.config import DEFAULT_CONFIG_PATH, Config, load_config
+from aw_coach.time_utils import format_local_timestamp, parse_stored_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -1079,6 +1081,91 @@ def notify_test() -> None:
 
 
 @main.command()
+def health() -> None:
+    """Show daemon, scheduling, delivery, and cost health."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    storage = Storage(config.db_path)
+
+    service_state = "unknown"
+    if shutil.which("systemctl"):
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-active", "aw-coach.service"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            service_state = proc.stdout.strip() or proc.stderr.strip() or "unknown"
+        except Exception:
+            service_state = "unknown"
+
+    last_hourly = storage.get_scheduler_state("last_hourly", "unknown")
+    last_summary = storage.get_scheduler_state("last_summary", "unknown")
+    next_summary = "unknown"
+    if last_summary and last_summary != "unknown":
+        try:
+            next_dt = parse_stored_timestamp(last_summary) + timedelta(
+                hours=config.report.instant_summary_interval_hours
+            )
+            next_summary = next_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            next_summary = "unknown"
+
+    daily_done = storage.get_scheduler_state(
+        f"daily_report_done:{date_type.today().isoformat()}", "0"
+    )
+    recent_delivery = storage.get_recent_delivery_logs(limit=1)
+    recent_issue = storage.get_recent_delivery_issue()
+    total_cost = storage.get_monthly_cost()
+
+    click.echo(f"service:        {service_state}")
+    click.echo(f"last_hourly:    {_format_health_time(last_hourly)}")
+    click.echo(f"last_summary:   {_format_health_time(last_summary)}")
+    click.echo(f"next_summary:   {next_summary}")
+    click.echo(f"daily_report:   {'done' if daily_done == '1' else 'pending'}")
+    click.echo(f"delivery_mode:  summary={config.report.delivery.instant_summary}, "
+               f"daily={config.report.delivery.daily_report}, "
+               f"medium={config.report.delivery.medium_signal}")
+    click.echo(f"llm_timeout:    {config.report.llm_timeout_seconds}s")
+    click.echo(
+        f"cost:           ${total_cost:.2f}/${config.cost.monthly_budget_usd:.2f}"
+    )
+
+    if recent_delivery:
+        item = recent_delivery[0]
+        click.echo(
+            "last_delivery: "
+            f"{format_local_timestamp(item['timestamp'])} "
+            f"{item['kind']}/{item['channel']} {item['status']} "
+            f"{item.get('reason') or ''}".rstrip()
+        )
+    else:
+        click.echo("last_delivery: none")
+
+    if recent_issue:
+        click.echo(
+            "last_issue:    "
+            f"{format_local_timestamp(recent_issue['timestamp'])} "
+            f"{recent_issue['kind']}/{recent_issue['channel']} "
+            f"{recent_issue['status']} {recent_issue.get('reason') or ''}".rstrip()
+        )
+    else:
+        click.echo("last_issue:    none")
+
+
+def _format_health_time(value: Optional[str]) -> str:
+    if not value or value == "unknown":
+        return "unknown"
+    try:
+        return format_local_timestamp(value)
+    except Exception:
+        return value
+
+
+@main.command()
 def cost() -> None:
     """View AI API cost usage."""
     config = load_config()
@@ -1575,7 +1662,11 @@ def inbox_list(show_all: bool, limit: int) -> None:
     if show_all:
         open_items = storage.get_inbox_items(dismissed=False, limit=limit)
         done_items = storage.get_inbox_items(dismissed=True, limit=limit)
-        items = sorted(open_items + done_items, key=lambda x: x["timestamp"], reverse=True)[:limit]
+        items = sorted(
+            open_items + done_items,
+            key=lambda x: parse_stored_timestamp(x["timestamp"]),
+            reverse=True,
+        )[:limit]
     else:
         items = storage.get_inbox_items(dismissed=False, limit=limit)
 
@@ -1586,7 +1677,8 @@ def inbox_list(show_all: bool, limit: int) -> None:
     for item in items:
         status = "dismissed" if item.get("dismissed") else "open"
         click.echo(
-            f"[{item['id']}] {item['timestamp']} | {item['signal_type']} "
+            f"[{item['id']}] {format_local_timestamp(item['timestamp'])} "
+            f"| {item['signal_type']} "
             f"| sev={item['severity']:.1f} | {status}"
         )
         if item.get("evidence"):

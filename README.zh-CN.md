@@ -43,6 +43,7 @@ python -m pip install -e ".[dev,ai,screenshot,web]"
 
 ```bash
 aw-coach doctor          # 环境诊断
+aw-coach health          # daemon / 推送 / 调度健康概览
 aw-coach status          # 今日概览
 aw-coach state           # 实时语义状态（需 daemon）
 aw-coach report          # 日报
@@ -105,6 +106,17 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false   # 灰度开启后台 LLM 叙事摘要
 morning_brief_time = "09:00"
+llm_timeout_seconds = 90
+
+[report.delivery]
+instant_summary = "notify"   # notify | inbox | both | off
+daily_report = "notify"
+morning_brief = "inbox"
+medium_signal = "inbox"
+high_severity_signal = "notify"
+task_confirm = "inbox"
+task_confirm_min_minutes = 10
+task_confirm_daily_limit = 3
 
 [tasks]
 enabled = true
@@ -124,6 +136,7 @@ enabled = false    # 默认关闭，保护隐私
 | `aw-coach task list/confirm/set/review` | 任务感知与校准 |
 | `aw-coach serve` | 交互式 Web 仪表盘 |
 | `aw-coach cost` | LLM 成本统计 |
+| `aw-coach health` | daemon、推送与调度健康概览 |
 | `aw-coach config show/set/path` | 配置管理 |
 | `aw-coach service status/logs` | Windows 服务诊断 |
 

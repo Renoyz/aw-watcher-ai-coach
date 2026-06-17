@@ -45,6 +45,7 @@ python -m pip install -e ".[dev,ai,screenshot,web]"
 
 ```bash
 aw-coach doctor
+aw-coach health
 aw-coach status
 aw-coach state
 aw-coach report
@@ -108,6 +109,17 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false
 morning_brief_time = "09:00"
+llm_timeout_seconds = 90
+
+[report.delivery]
+instant_summary = "notify"   # notify | inbox | both | off
+daily_report = "notify"
+morning_brief = "inbox"
+medium_signal = "inbox"
+high_severity_signal = "notify"
+task_confirm = "inbox"
+task_confirm_min_minutes = 10
+task_confirm_daily_limit = 3
 
 [tasks]
 enabled = true
@@ -129,6 +141,7 @@ classification instead of making external calls.
 | `aw-coach task list/confirm/set/review` | Task perception and calibration |
 | `aw-coach serve` | Interactive web dashboard |
 | `aw-coach cost` | LLM cost statistics |
+| `aw-coach health` | Daemon, delivery, and schedule health |
 | `aw-coach config show/set/path` | Configuration management |
 | `aw-coach service status/logs` | Windows service diagnostics |
 

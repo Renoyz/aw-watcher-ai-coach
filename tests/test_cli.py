@@ -11,7 +11,7 @@ from click.testing import CliRunner
 
 from aw_coach.cli import main
 from aw_coach.collector import ActivitySlice, DataCollector
-from aw_coach.config import Config, load_config
+from aw_coach.config import Config, CostConfig, ReportConfig, load_config
 from aw_coach.storage import Storage
 
 
@@ -75,6 +75,29 @@ def test_quiet_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["-q", "cost"])
     assert result.exit_code == 0
+
+
+def test_health_command_reads_local_state(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        report=ReportConfig(),
+        cost=CostConfig(monthly_budget_usd=5.0),
+    )
+    storage = Storage(cfg.db_path)
+    storage.set_scheduler_state("last_hourly", "2026-06-17T09:00:00")
+    storage.set_scheduler_state("last_summary", "2026-06-17T09:30:00")
+    storage.record_delivery("summary", "notify", "sent", "ok", "AI Coach 摘要")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli.shutil.which", return_value=None):
+        runner = CliRunner()
+        result = runner.invoke(main, ["health"])
+
+    assert result.exit_code == 0
+    assert "service:" in result.output
+    assert "last_summary:" in result.output
+    assert "last_delivery:" in result.output
+    assert "summary=notify" in result.output
 
 
 def test_config_path_command(monkeypatch, tmp_path):

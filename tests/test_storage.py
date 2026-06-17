@@ -121,3 +121,33 @@ class TestStorageInit:
         s1.record_cost("m", 100, 50, 0.01, "op")
         s2 = Storage(db_path)  # Re-open, re-migrate
         assert s2.get_monthly_cost() == pytest.approx(0.01)
+
+
+class TestDeliveryLog:
+    def test_record_and_read_recent_delivery(self, storage):
+        storage.record_delivery(
+            "summary",
+            "notify",
+            "sent",
+            reason="ok",
+            title="AI Coach 摘要",
+        )
+
+        rows = storage.get_recent_delivery_logs(limit=5)
+
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "summary"
+        assert rows[0]["channel"] == "notify"
+        assert rows[0]["status"] == "sent"
+        assert rows[0]["reason"] == "ok"
+        assert "T" in rows[0]["timestamp"]
+
+    def test_recent_delivery_issue_filters_failed_or_suppressed(self, storage):
+        storage.record_delivery("summary", "notify", "sent")
+        storage.record_delivery("daily_report", "notify", "suppressed", "quiet_hours")
+
+        issue = storage.get_recent_delivery_issue()
+
+        assert issue is not None
+        assert issue["kind"] == "daily_report"
+        assert issue["status"] == "suppressed"

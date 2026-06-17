@@ -7,7 +7,7 @@ import logging
 import signal
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -76,6 +76,9 @@ class CoachScheduler:
         self._task_signal_extractor = None
         self._task_fusion = None
         self._task_tracker = None
+        self._task_confirm_candidates: Dict[str, datetime] = {}
+        self._task_confirm_count_date: Optional[date] = None
+        self._task_confirm_count = 0
 
         # Background LLM summary worker
         self._summary_executor = ThreadPoolExecutor(
@@ -96,8 +99,14 @@ class CoachScheduler:
             self._storage = Storage(self.config.db_path)
         return self._storage
 
-    def _classify_slices(self, slices):
+    def _classify_slices(self, slices, *, allow_llm: bool = True):
         """Classify slices using either RuleEngine or HybridBackend."""
+        if not allow_llm:
+            engine = self._get_rule_engine()
+            return [
+                engine.classify(s.primary_app, s.primary_title, s.web_url)
+                for s in slices
+            ]
         return self.classifier.batch_classify(slices)
 
     # ------------------------------------------------------------------
@@ -456,19 +465,37 @@ class CoachScheduler:
 
     def _maybe_queue_task_confirm_inbox(self, state, now: datetime) -> None:
         key = f"task_confirm:{state.task_id}"
-        elapsed = self._notification_gate.seconds_since(key, now)
+        if self._task_confirm_count_date != now.date():
+            self._task_confirm_count_date = now.date()
+            self._task_confirm_count = 0
+
+        if (
+            self._task_confirm_count
+            >= self.config.report.delivery.task_confirm_daily_limit
+        ):
+            return
+
+        first_seen = self._task_confirm_candidates.setdefault(key, now)
+        required_seconds = self.config.report.delivery.task_confirm_min_minutes * 60
+        if (now - first_seen).total_seconds() < required_seconds:
+            return
+
+        sent_key = f"task_confirm_sent:{state.task_id}"
+        elapsed = self._notification_gate.seconds_since(sent_key, now)
         if elapsed is not None and elapsed < 3600:
             return
-        try:
-            self.storage.add_inbox_item(
-                signal_type="task_confirm",
-                severity=0.4,
-                evidence=f"无法确认当前任务：{state.task_label or state.task_id}",
-                reason="低置信度任务识别，请运行 aw-coach task confirm",
-            )
-            self._notification_gate.record_event(key, now)
-        except Exception:
-            logger.debug("Task confirm inbox failed", exc_info=True)
+
+        self._deliver_message(
+            kind="task_confirm",
+            title="AI Coach · task_confirm",
+            body=f"无法确认当前任务：{state.task_label or state.task_id}",
+            severity=0.4,
+            reason="低置信度任务识别，请运行 aw-coach task confirm",
+            now=now,
+            delivery=self.config.report.delivery.task_confirm,
+        )
+        self._notification_gate.record_event(sent_key, now)
+        self._task_confirm_count += 1
 
     def _apply_policy_decision(self, decision: ActionDecision, signal, now: datetime) -> None:
         """Execute the action chosen by the policy engine, respecting the state machine."""
@@ -488,16 +515,16 @@ class CoachScheduler:
                 )
                 return
             logger.info(f"Policy: inbox | {decision.reason} | {signal.signal_type}")
-            try:
-                self.storage.add_inbox_item(
-                    signal_type=signal.signal_type,
-                    severity=signal.severity,
-                    evidence=decision.evidence or signal.evidence,
-                    reason=decision.reason,
-                )
-                sm.transition_to(sm.state, signal_type=signal.signal_type, action="inbox")
-            except Exception:
-                logger.debug("Inbox save failed", exc_info=True)
+            self._deliver_message(
+                kind=signal.signal_type,
+                title=f"AI Coach · {signal.signal_type}",
+                body=decision.evidence or signal.evidence,
+                severity=signal.severity,
+                reason=decision.reason,
+                now=now,
+                delivery=self.config.report.delivery.medium_signal,
+            )
+            sm.transition_to(sm.state, signal_type=signal.signal_type, action="inbox")
             self._persist_state_machine()
             return
 
@@ -511,28 +538,107 @@ class CoachScheduler:
             logger.info(f"Policy: notify_now | {decision.reason} | {signal.signal_type}")
             try:
                 sm.transition_to(sm.state, signal_type=signal.signal_type, action="notify")
-                allowed, _reason = self._notification_gate.allow_notify(
-                    signal.signal_type, now=now
+                result = self._deliver_message(
+                    kind=signal.signal_type,
+                    title=f"AI Coach · {signal.signal_type}",
+                    body=decision.evidence or signal.evidence,
+                    severity=signal.severity,
+                    reason=decision.reason,
+                    now=now,
+                    delivery=self.config.report.delivery.high_severity_signal,
                 )
-                if allowed:
-                    send_notification(
-                        title=f"AI Coach · {signal.signal_type}",
-                        body=decision.evidence or signal.evidence,
-                    )
-                    self._notification_gate.record_notify(signal.signal_type, now)
-                else:
-                    self.storage.add_inbox_item(
+                if result.get("notified"):
+                    sm.record_notification()
+                    sm.transition_to(
+                        sm.state,
                         signal_type=signal.signal_type,
-                        severity=signal.severity,
-                        evidence=decision.evidence or signal.evidence,
-                        reason=f"通知被抑制: {_reason}",
+                        action="await_feedback",
                     )
-                sm.record_notification()
-                sm.transition_to(sm.state, signal_type=signal.signal_type, action="await_feedback")
             except Exception:
                 logger.debug("Notify failed", exc_info=True)
             self._persist_state_machine()
             return
+
+    def _record_delivery(
+        self,
+        kind: str,
+        channel: str,
+        status: str,
+        reason: str = "",
+        title: str = "",
+    ) -> None:
+        try:
+            self.storage.record_delivery(kind, channel, status, reason, title)
+        except Exception:
+            logger.debug("Delivery log save failed", exc_info=True)
+
+    def _delivery_for_kind(self, kind: str) -> str:
+        delivery = self.config.report.delivery
+        if kind == "summary":
+            return delivery.instant_summary
+        if kind == "daily_report":
+            return delivery.daily_report
+        if kind == "morning_brief":
+            return delivery.morning_brief
+        if kind == "task_confirm":
+            return delivery.task_confirm
+        return delivery.medium_signal
+
+    def _deliver_message(
+        self,
+        *,
+        kind: str,
+        title: str,
+        body: str,
+        severity: float,
+        reason: str,
+        now: datetime,
+        delivery: str,
+        detail_url: Optional[str] = None,
+    ) -> Dict[str, bool]:
+        """Deliver one user-facing message and log all channel outcomes."""
+        result = {"notified": False, "inbox": False}
+        if delivery == "off":
+            self._record_delivery(kind, "none", "suppressed", "delivery_off", title)
+            return result
+
+        wants_notify = delivery in {"notify", "both"}
+        wants_inbox = delivery in {"inbox", "both"}
+        inbox_reason = reason
+
+        if wants_notify:
+            if not self._should_notify():
+                inbox_reason = "通知被抑制: cli_only"
+                self._record_delivery(kind, "notify", "suppressed", "cli_only", title)
+            else:
+                allowed, deny_reason = self._notification_gate.allow_notify(kind, now=now)
+                if allowed:
+                    sent = send_notification(title, body, detail_url=detail_url)
+                    if sent:
+                        self._notification_gate.record_notify(kind, now)
+                        result["notified"] = True
+                        self._record_delivery(kind, "notify", "sent", reason, title)
+                    else:
+                        inbox_reason = "通知发送失败，已转入 inbox"
+                        self._record_delivery(kind, "notify", "failed", "send_failed", title)
+                else:
+                    inbox_reason = f"通知被抑制: {deny_reason}"
+                    self._record_delivery(kind, "notify", "suppressed", deny_reason, title)
+
+        if wants_inbox or (wants_notify and not result["notified"]):
+            try:
+                self.storage.add_inbox_item(
+                    signal_type=kind,
+                    severity=severity,
+                    evidence=body,
+                    reason=inbox_reason,
+                )
+                result["inbox"] = True
+                self._record_delivery(kind, "inbox", "sent", inbox_reason, title)
+            except Exception:
+                self._record_delivery(kind, "inbox", "failed", "save_failed", title)
+                logger.debug("Inbox save failed", exc_info=True)
+        return result
 
     def _deliver_summary(
         self,
@@ -542,28 +648,25 @@ class CoachScheduler:
         *,
         now: datetime,
         detail_url: Optional[str] = None,
-        prefer_notify: bool = True,
+        prefer_notify: Optional[bool] = None,
+        delivery: Optional[str] = None,
     ) -> None:
         """Deliver summary via notify or inbox using NotificationGate."""
         self._save_summary_archive(kind, title, body, now)
-        if not self._should_notify():
-            return
 
-        allowed, reason = self._notification_gate.allow_notify(kind, now=now)
-        if prefer_notify and allowed:
-            send_notification(title, body, detail_url=detail_url)
-            self._notification_gate.record_notify(kind, now)
-            return
-
-        try:
-            self.storage.add_inbox_item(
-                signal_type=kind,
-                severity=0.5,
-                evidence=body,
-                reason=f"摘要存档（通知抑制: {reason}）",
-            )
-        except Exception:
-            logger.debug("Summary inbox save failed", exc_info=True)
+        selected = delivery or self._delivery_for_kind(kind)
+        if prefer_notify is not None:
+            selected = "notify" if prefer_notify else "inbox"
+        self._deliver_message(
+            kind=kind,
+            title=title,
+            body=body,
+            severity=0.5,
+            reason="摘要存档",
+            now=now,
+            detail_url=detail_url,
+            delivery=selected,
+        )
 
     def _save_summary_archive(self, kind: str, title: str, body: str, now: datetime) -> None:
         try:
@@ -751,7 +854,7 @@ class CoachScheduler:
                     f"Flushing partial hour: "
                     f"{last_boundary.strftime('%H:%M')}-{now.strftime('%H:%M')}"
                 )
-                self._hourly_analyze(last_boundary, now)
+                self._hourly_analyze(last_boundary, now, allow_llm=False)
         except Exception as e:
             logger.warning(f"Flush on shutdown failed (non-fatal): {e}")
         try:
@@ -785,7 +888,13 @@ class CoachScheduler:
 
         return current
 
-    def _hourly_analyze(self, hour_start: datetime, hour_end: datetime) -> bool:
+    def _hourly_analyze(
+        self,
+        hour_start: datetime,
+        hour_end: datetime,
+        *,
+        allow_llm: bool = True,
+    ) -> bool:
         try:
             slices = self.collector.fetch_range(hour_start, hour_end)
         except Exception as e:
@@ -795,7 +904,7 @@ class CoachScheduler:
         if not slices:
             return True
 
-        rules = self._classify_slices(slices)
+        rules = self._classify_slices(slices, allow_llm=allow_llm)
         analysis = self.analyzer.analyze(slices, rules)
 
         # Determine dominant activity type
@@ -950,7 +1059,7 @@ class CoachScheduler:
         detail_url: Optional[str] = None,
         active_signals: Optional[List[str]] = None,
         silent_on_failure: bool = False,
-        prefer_notify_fallback: bool = True,
+        prefer_notify_fallback: Optional[bool] = None,
     ) -> None:
         if not self.config.report.background_ai_summary:
             self._deliver_summary(
@@ -965,11 +1074,16 @@ class CoachScheduler:
 
         semantic = self._semantic_payload
         corrections = self.storage.get_corrections_last_30_days()
-        cost = self._get_cost_controller()
         task_sessions = self._get_task_sessions_for_summary()
         config = self.config
 
         def _work():
+            from aw_coach.ai.cost import CostController
+            from aw_coach.storage import Storage
+
+            # The scheduler's Storage connection belongs to the daemon thread.
+            # Background workers need their own SQLite connection.
+            cost = CostController(config.cost, Storage(config.db_path))
             return generate_background_summary(
                 analysis,
                 config,
@@ -995,11 +1109,43 @@ class CoachScheduler:
             "detail_url": detail_url,
             "silent": silent_on_failure,
             "prefer_notify": prefer_notify_fallback,
+            "submitted_at": datetime.now(),
+            "timeout_seconds": self.config.report.llm_timeout_seconds,
         }
 
     def _poll_summary_future(self) -> None:
         pending = getattr(self, "_pending_summary_delivery", None)
-        if self._summary_future is None or not self._summary_future.done():
+        if self._summary_future is None:
+            return
+
+        if pending is not None and not self._summary_future.done():
+            submitted_at = pending.get("submitted_at")
+            timeout_seconds = pending.get(
+                "timeout_seconds", self.config.report.llm_timeout_seconds
+            )
+            if (
+                isinstance(submitted_at, datetime)
+                and (datetime.now() - submitted_at).total_seconds() >= timeout_seconds
+            ):
+                logger.warning(
+                    "Background summary timed out after %ss; using fallback",
+                    timeout_seconds,
+                )
+                self._summary_future.cancel()
+                self._summary_future = None
+                if not pending.get("silent"):
+                    self._deliver_summary(
+                        pending["kind"],
+                        pending["title"],
+                        pending["fallback_body"],
+                        now=pending["now"],
+                        detail_url=pending.get("detail_url"),
+                        prefer_notify=pending.get("prefer_notify", True),
+                    )
+                self._pending_summary_delivery = None
+            return
+
+        if not self._summary_future.done():
             return
         try:
             ai_text = self._summary_future.result()
@@ -1021,9 +1167,53 @@ class CoachScheduler:
             body,
             now=pending["now"],
             detail_url=pending.get("detail_url"),
-            prefer_notify=ai_text is not None and pending.get("prefer_notify", True),
+            prefer_notify=pending.get("prefer_notify", True),
         )
         self._pending_summary_delivery = None
+
+    def _generate_ai_summary_with_timeout(
+        self,
+        analysis,
+        *,
+        active_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Generate an AI summary with a bounded wait and worker-local storage."""
+        config = self.config
+        semantic = self._semantic_payload
+        corrections = self.storage.get_corrections_last_30_days()
+        task_sessions = self._get_task_sessions_for_summary()
+
+        def _work():
+            from aw_coach.ai.cost import CostController
+            from aw_coach.storage import Storage
+
+            cost = CostController(config.cost, Storage(config.db_path))
+            return generate_background_summary(
+                analysis,
+                config,
+                cost_controller=cost,
+                semantic_state=semantic,
+                corrections=corrections,
+                task_sessions=task_sessions,
+                active_signals=active_signals,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aw-coach-ai-once")
+        future = executor.submit(_work)
+        try:
+            return future.result(timeout=self.config.report.llm_timeout_seconds)
+        except TimeoutError:
+            future.cancel()
+            logger.warning(
+                "AI summary timed out after %ss; using fallback",
+                self.config.report.llm_timeout_seconds,
+            )
+            return None
+        except Exception:
+            logger.debug("AI summary failed", exc_info=True)
+            return None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _send_instant_summary(self, now: datetime) -> None:
         interval = self.config.report.instant_summary_interval_hours
@@ -1135,15 +1325,7 @@ class CoachScheduler:
 
         ai_summary = None
         if use_ai:
-            cost = self._get_cost_controller()
-            ai_summary = generate_background_summary(
-                analysis,
-                self.config,
-                cost_controller=cost,
-                semantic_state=self._semantic_payload,
-                corrections=self.storage.get_corrections_last_30_days(),
-                task_sessions=self._get_task_sessions_for_summary(),
-            )
+            ai_summary = self._generate_ai_summary_with_timeout(analysis)
             if ai_summary:
                 report_text += f"\n\n## AI 总结\n\n{ai_summary}\n"
 
@@ -1195,7 +1377,7 @@ class CoachScheduler:
             notify_body,
             now=datetime.now(),
             detail_url=detail_url,
-            prefer_notify=False,
+            delivery=self.config.report.delivery.daily_report,
         )
         return True
 

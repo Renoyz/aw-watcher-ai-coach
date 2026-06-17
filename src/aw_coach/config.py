@@ -18,6 +18,7 @@ else:
 from pydantic import BaseModel, field_validator
 
 VALID_BACKENDS = ("rule_only", "openai", "hybrid")
+VALID_DELIVERY_CHANNELS = ("notify", "inbox", "both", "off")
 
 DEFAULT_CONFIG_PATH = Path("~/.config/activitywatch/aw-watcher-ai-coach.toml").expanduser()
 DEFAULT_DATA_DIR = Path("~/.local/share/activitywatch/aw-watcher-ai-coach").expanduser()
@@ -41,6 +42,34 @@ class PolicyConfig(BaseModel):
     quiet_hours_end: str = "08:00"
 
 
+class DeliveryConfig(BaseModel):
+    instant_summary: str = "notify"
+    daily_report: str = "notify"
+    morning_brief: str = "inbox"
+    high_severity_signal: str = "notify"
+    medium_signal: str = "inbox"
+    task_confirm: str = "inbox"
+    task_confirm_min_minutes: int = 10
+    task_confirm_daily_limit: int = 3
+
+    @field_validator(
+        "instant_summary",
+        "daily_report",
+        "morning_brief",
+        "high_severity_signal",
+        "medium_signal",
+        "task_confirm",
+    )
+    @classmethod
+    def validate_channel(cls, v: str) -> str:
+        if v not in VALID_DELIVERY_CHANNELS:
+            raise ValueError(
+                f"Invalid delivery channel '{v}'. Must be one of: "
+                f"{VALID_DELIVERY_CHANNELS}"
+            )
+        return v
+
+
 class ReportConfig(BaseModel):
     daily_report_time: str = "21:00"
     morning_brief_time: str = "09:00"
@@ -48,9 +77,11 @@ class ReportConfig(BaseModel):
     notification_method: str = "both"
     daily_notification_budget: int = 4
     notification_cooldown_seconds: int = 600
+    llm_timeout_seconds: int = 90
     background_ai_summary: bool = False
     silent_if_effective_hours_below: float = 0.5
     always_notify_signals: List[str] = ["stuck", "search_loop", "death_loop"]
+    delivery: DeliveryConfig = DeliveryConfig()
 
 
 class TasksConfig(BaseModel):

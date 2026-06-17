@@ -17,6 +17,10 @@ def test_default_config_no_file():
     assert config.cost.monthly_budget_usd == 2.86
     assert config.analysis.deep_work_threshold_minutes == 15
     assert config.report.daily_report_time == "21:00"
+    assert config.report.delivery.instant_summary == "notify"
+    assert config.report.delivery.daily_report == "notify"
+    assert config.report.delivery.medium_signal == "inbox"
+    assert config.report.llm_timeout_seconds == 90
 
 
 def test_partial_config_merges_with_defaults():
@@ -61,6 +65,12 @@ work_days = [1, 2, 3, 4, 5]
 daily_report_time = "22:00"
 instant_summary_interval_hours = 3
 notification_method = "cli_only"
+llm_timeout_seconds = 45
+
+[report.delivery]
+instant_summary = "both"
+daily_report = "inbox"
+medium_signal = "notify"
 
 [ai]
 backend = "openai"
@@ -79,6 +89,10 @@ alert_thresholds = [0.5, 0.9]
     assert config.analysis.deep_work_threshold_minutes == 30
     assert config.analysis.distraction_apps == ["youtube", "tiktok"]
     assert config.report.daily_report_time == "22:00"
+    assert config.report.llm_timeout_seconds == 45
+    assert config.report.delivery.instant_summary == "both"
+    assert config.report.delivery.daily_report == "inbox"
+    assert config.report.delivery.medium_signal == "notify"
     assert config.ai.backend == "openai"
     assert config.cost.monthly_budget_usd == 20.0
 
@@ -90,6 +104,23 @@ def test_invalid_backend_raises():
     toml_content = """
 [ai]
 backend = "invalid_backend"
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(toml_content)
+        f.flush()
+        with pytest.raises(ValueError):
+            load_config(config_path=Path(f.name))
+
+    os.unlink(f.name)
+
+
+def test_invalid_delivery_channel_raises():
+    """Invalid delivery channel value should raise a validation error."""
+    from aw_coach.config import load_config
+
+    toml_content = """
+[report.delivery]
+instant_summary = "desktop"
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(toml_content)
