@@ -320,6 +320,156 @@ def _get_analysis(target_date: date_type, config: Config):
     return _compute_live_analysis(target_date, config, rule_only=False)
 
 
+def _task_breakdown_from_sessions(storage, target: date_type) -> Optional[Dict[str, float]]:
+    rows = storage.get_task_session_summary(target.isoformat())
+    if not rows:
+        return None
+    return {
+        row["label"]: row["total_sec"] / 3600
+        for row in rows
+        if row.get("total_sec")
+    }
+
+
+def _task_time(value: Optional[str]) -> str:
+    if not value:
+        return "--:--"
+    try:
+        return parse_stored_timestamp(value).astimezone().strftime("%H:%M")
+    except (TypeError, ValueError):
+        return str(value)[:5]
+
+
+def _format_task_hours(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h"
+
+
+def _collect_task_replay(target: date_type, config: Config):
+    from aw_coach.collector import DataCollector
+    from aw_coach.rules.engine import RuleEngine
+    from aw_coach.task_signals import annotate_task_slices
+
+    start = datetime.combine(target, datetime.min.time())
+    end = datetime.combine(target, datetime.max.time())
+    if target == date_type.today():
+        end = datetime.now()
+
+    collector = DataCollector()
+    slices = collector.fetch_range(start, end)
+    engine = RuleEngine.with_all_rules()
+    rules = [
+        engine.classify(s.primary_app, s.primary_title, s.web_url)
+        for s in slices
+    ]
+    if config.tasks.enabled:
+        annotate_task_slices(slices, rules, config.tasks)
+    sessions = _build_task_sessions_from_slices(slices, rules)
+    return slices, rules, sessions
+
+
+def _build_task_sessions_from_slices(slices, rules):
+    from aw_coach.analyzer import DISTRACTION_TYPES
+    from aw_coach.task_models import TaskEvidence, TaskSession
+    from aw_coach.task_tracker import MERGE_GAP_SEC, ORPHAN_SEC
+
+    sessions: List[TaskSession] = []
+    current: Optional[TaskSession] = None
+
+    def finish_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        if current.accumulated_sec >= ORPHAN_SEC or current.blockers:
+            current.outcome = "blocked" if current.blockers else "progressed"
+            sessions.append(current)
+        current = None
+
+    for s, r in sorted(zip(slices, rules), key=lambda item: item[0].start):
+        if s.is_afk or getattr(r, "skip_analysis", False):
+            finish_current()
+            continue
+        if r.activity_type in DISTRACTION_TYPES:
+            finish_current()
+            continue
+
+        task_id = getattr(s, "task_id", None)
+        label = getattr(s, "task_label", None)
+        if not task_id or str(task_id).startswith("unknown:"):
+            finish_current()
+            continue
+
+        gap = 0.0
+        if current is not None and current.ended_at is not None:
+            gap = (s.start - current.ended_at).total_seconds()
+        if current is None or current.task_id != task_id or gap >= MERGE_GAP_SEC:
+            finish_current()
+            current = TaskSession(
+                task_id=task_id,
+                label=label or task_id,
+                project=getattr(s, "semantic_project", None) or getattr(s, "git_repo", None),
+                intent=r.activity_type,
+                started_at=s.start,
+                ended_at=s.end,
+                accumulated_sec=0.0,
+                confidence=float(getattr(s, "task_confidence", 0.0) or r.confidence),
+                source=_slice_task_source(s, r),
+            )
+
+        current.ended_at = s.end
+        current.accumulated_sec += float(getattr(s, "duration", 0.0) or 0.0)
+        current.confidence = max(
+            current.confidence,
+            float(getattr(s, "task_confidence", 0.0) or r.confidence),
+        )
+        if r.activity_type not in current.modes:
+            current.modes.append(r.activity_type)
+        _merge_task_evidence(
+            current,
+            [
+                TaskEvidence("rule", r.activity_type, r.confidence),
+                *(
+                    [TaskEvidence("git", s.git_branch, current.confidence)]
+                    if getattr(s, "git_branch", None)
+                    else []
+                ),
+                *(
+                    [TaskEvidence("url", s.web_url, current.confidence)]
+                    if getattr(s, "web_url", None)
+                    else []
+                ),
+            ],
+        )
+        current.source.update(_slice_task_source(s, r))
+
+    finish_current()
+    return sessions
+
+
+def _slice_task_source(s, r) -> Dict[str, Any]:
+    return {
+        "app": s.primary_app,
+        "title": s.primary_title,
+        "url": s.web_url,
+        "git_repo": getattr(s, "git_repo", None),
+        "git_branch": getattr(s, "git_branch", None),
+        "semantic_project": getattr(s, "semantic_project", None),
+        "rule_activity": r.activity_type,
+        "rule_confidence": r.confidence,
+    }
+
+
+def _merge_task_evidence(session, evidence) -> None:
+    seen = {(item.source, item.value) for item in session.evidence}
+    for item in evidence:
+        if not item.value:
+            continue
+        key = (item.source, item.value)
+        if key in seen:
+            continue
+        session.evidence.append(item)
+        seen.add(key)
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="aw-coach")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output (DEBUG level)")
@@ -766,14 +916,19 @@ def report(full: bool, dry_run: bool, date: str) -> None:
     # Decide whether AI suggestions are requested.
     use_ai = full and not dry_run and config.ai.backend != "rule_only"
 
-    # Task/project breakdown
-    project_breakdown = analysis.task_breakdown or None
+    # Task/project breakdown. The task ledger is authoritative when present;
+    # live analysis remains the fallback for days before ledger data exists.
+    project_breakdown = None
     inbox_items = None
     try:
         from aw_coach.storage import Storage
 
         storage = Storage(config.db_path)
         inbox_items = storage.get_inbox_items(dismissed=False, limit=10)
+        project_breakdown = _task_breakdown_from_sessions(storage, target)
+        if project_breakdown is None:
+            project_breakdown = analysis.task_breakdown or None
+
         if project_breakdown is None:
             task_rows = storage.get_task_daily_summary(target.isoformat())
             if task_rows:
@@ -1820,7 +1975,9 @@ def task_list(target_date: str) -> None:
     config = load_config()
     target = _parse_date(target_date)
     storage = Storage(config.db_path)
-    rows = storage.get_task_daily_summary(target.isoformat())
+    rows = storage.get_task_session_summary(target.isoformat())
+    if not rows:
+        rows = storage.get_task_daily_summary(target.isoformat())
     if not rows:
         click.echo(f"{target.isoformat()} 暂无任务汇总。")
         return
@@ -1828,6 +1985,116 @@ def task_list(target_date: str) -> None:
     for row in rows:
         hours = row["total_sec"] / 3600
         click.echo(f"  {row['label']:<28} {hours:>5.1f}h  ({row['task_id']})")
+
+
+@task.command("timeline")
+@click.argument("date", default="today")
+def task_timeline(date: str) -> None:
+    """Show the authoritative task timeline for a day."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(date)
+    rows = Storage(config.db_path).get_task_timeline(target.isoformat())
+    if not rows:
+        click.echo(f"{target.isoformat()} 暂无任务时间轴。")
+        return
+    click.echo(f"任务时间轴 — {target.isoformat()}")
+    for row in rows:
+        start = _task_time(row.get("started_at"))
+        end = _task_time(row.get("ended_at"))
+        hours = _format_task_hours(float(row.get("accumulated_sec") or 0.0))
+        confidence = float(row.get("confidence") or 0.0)
+        outcome = row.get("outcome") or "unknown"
+        click.echo(
+            f"  {start}-{end}  {hours:>5}  "
+            f"{row.get('label') or row.get('task_id')} "
+            f"[{outcome}, conf={confidence:.2f}]"
+        )
+
+
+@task.command("explain")
+@click.argument("date", default="today")
+def task_explain(date: str) -> None:
+    """Explain task sessions with evidence and source signals."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(date)
+    rows = Storage(config.db_path).get_task_timeline(target.isoformat())
+    if not rows:
+        click.echo(f"{target.isoformat()} 暂无任务证据。")
+        return
+    click.echo(f"任务解释 — {target.isoformat()}")
+    for row in rows:
+        start = _task_time(row.get("started_at"))
+        end = _task_time(row.get("ended_at"))
+        hours = _format_task_hours(float(row.get("accumulated_sec") or 0.0))
+        click.echo(
+            f"\n{start}-{end}  {hours}  "
+            f"{row.get('label') or row.get('task_id')} ({row.get('task_id')})"
+        )
+        click.echo(
+            f"  outcome={row.get('outcome')} "
+            f"confidence={float(row.get('confidence') or 0.0):.2f} "
+            f"uid={row.get('session_uid')}"
+        )
+        source = row.get("source") or {}
+        if source:
+            bits = [
+                f"{key}={value}"
+                for key, value in source.items()
+                if value not in (None, "")
+            ]
+            if bits:
+                click.echo("  source: " + "; ".join(bits[:8]))
+        evidence = row.get("evidence") or []
+        if evidence:
+            rendered = []
+            for item in evidence[:8]:
+                if not isinstance(item, dict):
+                    continue
+                rendered.append(
+                    f"{item.get('source')}={item.get('value')}"
+                    f"({float(item.get('confidence') or 0.0):.2f})"
+                )
+            if rendered:
+                click.echo("  evidence: " + "; ".join(rendered))
+
+
+@task.command("rebuild")
+@click.option("--apply", "apply_changes", is_flag=True, help="Write rebuilt sessions")
+@click.argument("date", default="today")
+def task_rebuild(apply_changes: bool, date: str) -> None:
+    """Rebuild task sessions for a day from raw ActivityWatch slices."""
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(date)
+    try:
+        slices, _rules, sessions = _collect_task_replay(target, config)
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+    click.echo(
+        f"{target.isoformat()} replay: "
+        f"{len(slices)} slice(s), {len(sessions)} task session(s)"
+    )
+    for session in sessions:
+        start = session.started_at.strftime("%H:%M")
+        end = session.ended_at.strftime("%H:%M") if session.ended_at else "--:--"
+        click.echo(
+            f"  {start}-{end}  {_format_task_hours(session.accumulated_sec):>5}  "
+            f"{session.label} [{session.outcome}, conf={session.confidence:.2f}]"
+        )
+
+    if not apply_changes:
+        click.echo("Dry-run only. Use --apply to replace stored sessions for this day.")
+        return
+
+    storage = Storage(config.db_path)
+    storage.replace_task_sessions_for_day(target.isoformat(), sessions)
+    click.echo(f"已重建 {target.isoformat()} 的任务账本。")
 
 
 @task.command("confirm")
@@ -1885,3 +2152,39 @@ def task_review(target_date: str, sample: int) -> None:
             correct += 1
     rate = correct / len(picked) * 100
     click.echo(f"\n准确率抽样: {correct}/{len(picked)} ({rate:.0f}%)")
+
+
+@main.command("debug-day")
+@click.argument("date", default="today")
+def debug_day(date: str) -> None:
+    """Print replay diagnostics for one day."""
+    config = load_config()
+    target = _parse_date(date)
+    try:
+        slices, rules, sessions = _collect_task_replay(target, config)
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+    click.echo(f"debug-day {target.isoformat()}")
+    click.echo(f"raw_slices: {len(slices)}")
+    click.echo(f"rules:      {len(rules)}")
+    click.echo(f"sessions:   {len(sessions)}")
+    click.echo("\nSlices")
+    for s, r in list(zip(slices, rules))[:40]:
+        click.echo(
+            f"  {s.start.strftime('%H:%M')}-{s.end.strftime('%H:%M')} "
+            f"{int(s.duration):>5}s {s.primary_app} "
+            f"rule={r.activity_type}/{r.confidence:.2f} "
+            f"task={getattr(s, 'task_label', None) or getattr(s, 'task_id', None) or '-'}"
+        )
+    if len(slices) > 40:
+        click.echo(f"  ... {len(slices) - 40} more slice(s)")
+
+    click.echo("\nFinal sessions")
+    for session in sessions:
+        end = session.ended_at.strftime("%H:%M") if session.ended_at else "--:--"
+        click.echo(
+            f"  {session.started_at.strftime('%H:%M')}-{end} "
+            f"{_format_task_hours(session.accumulated_sec):>5} "
+            f"{session.label} ({session.task_id}) conf={session.confidence:.2f}"
+        )

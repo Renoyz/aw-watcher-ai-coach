@@ -12,8 +12,9 @@ from click.testing import CliRunner
 from aw_coach.analyzer import AnalysisResult
 from aw_coach.cli import _dedupe_hourly_analysis_events, main
 from aw_coach.collector import ActivitySlice, DataCollector
-from aw_coach.config import Config, CostConfig, ReportConfig, load_config
+from aw_coach.config import Config, CostConfig, ReportConfig, TasksConfig, load_config
 from aw_coach.storage import Storage
+from aw_coach.task_models import TaskSession
 
 
 def test_version_flag():
@@ -156,6 +157,171 @@ def test_report_prefers_live_task_breakdown_over_stale_storage(tmp_path):
     assert result.exit_code == 0
     assert "fresh-task" in result.output
     assert "stale-task" not in result.output
+
+
+def test_report_prefers_task_session_ledger(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_session(
+        TaskSession(
+            task_id="ledger:task",
+            label="ledger-task",
+            project=None,
+            intent="implement",
+            started_at=datetime(2026, 6, 23, 9, 0),
+            ended_at=datetime(2026, 6, 23, 10, 0),
+            accumulated_sec=3600,
+            outcome="progressed",
+        )
+    )
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+        task_breakdown={"live-task": 1.0},
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["report", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "ledger-task" in result.output
+    assert "live-task" not in result.output
+
+
+def test_task_timeline_and_explain_commands(tmp_path):
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db")
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_session(
+        TaskSession(
+            task_id="aw-coach:main",
+            label="main.py",
+            project="aw-coach",
+            intent="implement",
+            started_at=datetime(2026, 6, 23, 9, 0),
+            ended_at=datetime(2026, 6, 23, 9, 30),
+            accumulated_sec=1800,
+            outcome="progressed",
+            confidence=0.8,
+            source={"app": "Code"},
+        )
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg):
+        runner = CliRunner()
+        timeline = runner.invoke(main, ["task", "timeline", "2026-06-23"])
+        explain = runner.invoke(main, ["task", "explain", "2026-06-23"])
+
+    assert timeline.exit_code == 0
+    assert "main.py" in timeline.output
+    assert "09:00-09:30" in timeline.output
+    assert explain.exit_code == 0
+    assert "uid=" in explain.output
+    assert "source: app=Code" in explain.output
+
+
+def test_task_rebuild_dry_run_does_not_write(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["task", "rebuild", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "Dry-run only" in result.output
+    assert Storage(cfg.db_path).get_task_timeline("2026-06-23") == []
+
+
+def test_task_rebuild_apply_writes_sessions(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["task", "rebuild", "--apply", "2026-06-23"])
+
+    assert result.exit_code == 0
+    rows = Storage(cfg.db_path).get_task_timeline("2026-06-23")
+    assert len(rows) == 1
+    assert rows[0]["label"].startswith("main.py")
+
+
+def test_debug_day_outputs_replay_stages(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["debug-day", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "raw_slices:" in result.output
+    assert "Final sessions" in result.output
 
 
 def test_health_command_reads_local_state(tmp_path):

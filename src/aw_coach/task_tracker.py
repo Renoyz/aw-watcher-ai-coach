@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from aw_coach.enriched_state import SemanticWorkState
-from aw_coach.task_models import TaskSession, WorkTask
+from aw_coach.task_models import TaskEvidence, TaskSession, WorkTask
 
 MERGE_GAP_SEC = 300
 ORPHAN_SEC = 120
@@ -27,7 +27,15 @@ class TaskSessionTracker:
     def completed_sessions(self) -> List[TaskSession]:
         return list(self._completed)
 
-    def update(self, task: WorkTask, state: SemanticWorkState, now: datetime) -> TaskSession:
+    def update(
+        self,
+        task: WorkTask,
+        state: SemanticWorkState,
+        now: datetime,
+        *,
+        evidence: Optional[List[TaskEvidence]] = None,
+        source: Optional[Dict[str, Any]] = None,
+    ) -> TaskSession:
         elapsed = 60.0
         if self._last_update is not None:
             elapsed = min((now - self._last_update).total_seconds(), 300.0)
@@ -43,9 +51,16 @@ class TaskSessionTracker:
                 intent=task.intent,
                 started_at=now,
                 confidence=task.confidence,
+                evidence=list(evidence or task.evidence),
+                source=dict(source or {}),
             )
 
         self._current.accumulated_sec += elapsed
+        self._merge_evidence(self._current, evidence or task.evidence)
+        if source:
+            self._current.source.update(
+                {key: value for key, value in source.items() if value is not None}
+            )
         if state.likely_mode and state.likely_mode not in self._current.modes:
             self._current.modes.append(state.likely_mode)
         if state.detected_signal and state.detected_signal not in self._current.blockers:
@@ -144,6 +159,18 @@ class TaskSessionTracker:
         tracker._last_update = cls._parse_datetime(data.get("last_update"))
         return tracker
 
+    @classmethod
+    def from_active_session(
+        cls,
+        session: TaskSession,
+        *,
+        last_update: Optional[datetime] = None,
+    ) -> "TaskSessionTracker":
+        tracker = cls()
+        tracker._current = session
+        tracker._last_update = last_update or session.ended_at or session.started_at
+        return tracker
+
     @staticmethod
     def _session_to_dict(session: Optional[TaskSession]) -> Optional[Dict[str, Any]]:
         if session is None:
@@ -154,30 +181,25 @@ class TaskSessionTracker:
     def _session_from_dict(cls, data: Any) -> Optional[TaskSession]:
         if not isinstance(data, dict):
             return None
-        started_at = cls._parse_datetime(data.get("started_at"))
-        if started_at is None:
+        try:
+            return TaskSession.from_dict(data)
+        except (TypeError, ValueError):
             return None
 
-        modes = data.get("modes") or []
-        blockers = data.get("blockers") or []
-        if not isinstance(modes, list):
-            modes = []
-        if not isinstance(blockers, list):
-            blockers = []
-
-        return TaskSession(
-            task_id=str(data.get("task_id") or "unknown:unknown"),
-            label=str(data.get("label") or data.get("task_id") or "unknown"),
-            project=data.get("project"),
-            intent=str(data.get("intent") or "unknown"),
-            started_at=started_at,
-            ended_at=cls._parse_datetime(data.get("ended_at")),
-            accumulated_sec=float(data.get("accumulated_sec") or 0.0),
-            modes=[str(mode) for mode in modes],
-            blockers=[str(blocker) for blocker in blockers],
-            outcome=str(data.get("outcome") or "in_progress"),
-            confidence=float(data.get("confidence") or 0.0),
-        )
+    @staticmethod
+    def _merge_evidence(
+        session: TaskSession,
+        evidence: Optional[List[TaskEvidence]],
+    ) -> None:
+        if not evidence:
+            return
+        seen = {(item.source, item.value) for item in session.evidence}
+        for item in evidence:
+            key = (item.source, item.value)
+            if key in seen:
+                continue
+            session.evidence.append(item)
+            seen.add(key)
 
     @staticmethod
     def _parse_datetime(value: Any) -> Optional[datetime]:

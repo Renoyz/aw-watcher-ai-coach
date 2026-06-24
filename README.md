@@ -52,6 +52,10 @@ aw-coach report
 aw-coach report --full
 aw-coach inbox list
 aw-coach task list
+aw-coach task timeline today
+aw-coach task explain today
+aw-coach task rebuild yesterday
+aw-coach debug-day yesterday
 aw-coach serve
 ```
 
@@ -154,7 +158,8 @@ classification instead of making external calls.
 | Command | Purpose |
 | --- | --- |
 | `aw-coach inbox list/dismiss/accept` | Proactive assistance inbox |
-| `aw-coach task list/confirm/set/review` | Task perception and calibration |
+| `aw-coach task list/timeline/explain/rebuild/confirm/set/review` | Task timeline, replay, and calibration |
+| `aw-coach debug-day DATE` | Replay diagnostics for raw slices, rules, and task sessions |
 | `aw-coach serve` | Interactive web dashboard |
 | `aw-coach cost` | LLM cost statistics |
 | `aw-coach health` | Daemon, delivery, and schedule health |

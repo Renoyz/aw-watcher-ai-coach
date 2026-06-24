@@ -452,6 +452,15 @@ class CoachScheduler:
             self._task_fusion = TaskFusionEngine()
         if self._task_tracker is None:
             self._task_tracker = self._restore_task_tracker()
+        current = self._task_tracker.current_session
+        if current is not None and self._task_fusion.state.confirmed_task_id is None:
+            self._task_fusion.restore_confirmed(
+                task_id=current.task_id,
+                label=current.label,
+                project=current.project,
+                intent=current.intent,
+                confidence=current.confidence,
+            )
 
         git_ctx = None
         if state.git_repo:
@@ -476,7 +485,16 @@ class CoachScheduler:
             project=state.semantic_project,
         )
         task = self._task_fusion.resolve(candidate)
-        self._task_tracker.update(task, state, now)
+        evidence = self._task_session_evidence(candidate, task, rule)
+        source = self._task_session_source(state, rule)
+        self._task_tracker.update(
+            task,
+            state,
+            now,
+            evidence=evidence,
+            source=source,
+        )
+        self._persist_current_task_session()
         self._persist_task_tracker()
 
         state.task_id = task.task_id
@@ -488,6 +506,19 @@ class CoachScheduler:
     def _restore_task_tracker(self):
         from aw_coach.task_tracker import TaskSessionTracker
 
+        try:
+            active = self.storage.get_active_task_session()
+            if active:
+                session = self.storage.task_session_from_row(active)
+                return TaskSessionTracker.from_active_session(
+                    session,
+                    last_update=self._parse_stored_datetime(
+                        active.get("updated_at")
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to restore active task session", exc_info=True)
+
         raw = self.storage.get_scheduler_state(TASK_TRACKER_STATE_KEY)
         if raw:
             try:
@@ -495,6 +526,48 @@ class CoachScheduler:
             except Exception:
                 logger.debug("Failed to restore task tracker, starting fresh", exc_info=True)
         return TaskSessionTracker()
+
+    @staticmethod
+    def _parse_stored_datetime(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _task_session_evidence(candidate, task, rule):
+        from aw_coach.task_models import TaskEvidence
+
+        evidence = []
+        if task.task_id == candidate.task_id:
+            evidence.extend(candidate.evidence)
+        else:
+            evidence.append(
+                TaskEvidence(
+                    "fusion",
+                    f"retained:{task.task_id}; candidate:{candidate.task_id}",
+                    task.confidence,
+                )
+            )
+        evidence.append(TaskEvidence("rule", rule.activity_type, rule.confidence))
+        return evidence
+
+    @staticmethod
+    def _task_session_source(state, rule) -> Dict:
+        return {
+            "app": state.current_app,
+            "title": state.current_title,
+            "url": state.current_url,
+            "git_repo": state.git_repo,
+            "git_branch": state.git_branch,
+            "semantic_project": state.semantic_project,
+            "semantic_filename": state.semantic_filename,
+            "likely_mode": state.likely_mode,
+            "rule_activity": rule.activity_type,
+            "rule_confidence": rule.confidence,
+        }
 
     def _persist_task_tracker(self) -> None:
         tasks_config = getattr(getattr(self, "config", None), "tasks", None)
@@ -511,6 +584,18 @@ class CoachScheduler:
             )
         except Exception:
             logger.debug("Task tracker persist failed", exc_info=True)
+
+    def _persist_current_task_session(self) -> None:
+        if not self.config.tasks.enabled or self._task_tracker is None:
+            return
+        current = self._task_tracker.current_session
+        if current is None:
+            return
+        try:
+            self.storage.upsert_task_session(current)
+            self.storage.rebuild_task_daily_summary(current.started_at.date().isoformat())
+        except Exception:
+            logger.debug("Current task session persist failed", exc_info=True)
 
     @staticmethod
     def _format_signal_evidence(state) -> str:
@@ -1624,38 +1709,16 @@ class CoachScheduler:
         """Persist drained completed sessions without flushing the active one."""
         if not self.config.tasks.enabled or self._task_tracker is None:
             return
-        totals: Dict[tuple, Dict] = {}
+        changed_days: set[str] = set()
         for session in self._task_tracker.drain_completed():
             try:
-                self.storage.save_task_session(
-                    task_id=session.task_id,
-                    label=session.label,
-                    project=session.project,
-                    intent=session.intent,
-                    started_at=session.started_at.isoformat(),
-                    ended_at=session.ended_at.isoformat() if session.ended_at else None,
-                    accumulated_sec=session.accumulated_sec,
-                    modes=session.modes,
-                    blockers=session.blockers,
-                    outcome=session.outcome,
-                    confidence=session.confidence,
-                )
+                self.storage.upsert_task_session(session)
+                changed_days.add(session.started_at.date().isoformat())
             except Exception:
                 logger.debug("Task session persist failed", exc_info=True)
-            day = session.started_at.date().isoformat()
-            entry = totals.setdefault(
-                (day, session.task_id),
-                {"label": session.label, "total_sec": 0.0},
-            )
-            entry["total_sec"] += session.accumulated_sec
-        for (day, task_id), entry in totals.items():
+        for day in changed_days:
             try:
-                self.storage.upsert_task_daily_summary(
-                    day,
-                    task_id,
-                    entry["label"],
-                    entry["total_sec"],
-                )
+                self.storage.rebuild_task_daily_summary(day)
             except Exception:
                 logger.debug("Task daily summary persist failed", exc_info=True)
         self._persist_task_tracker()

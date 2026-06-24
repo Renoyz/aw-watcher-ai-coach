@@ -206,3 +206,27 @@ class TestTaskTracker:
         session = restored.update(task, _state(), start + timedelta(hours=1))
 
         assert session.accumulated_sec == 360
+
+    def test_tracker_restores_from_active_session(self):
+        from aw_coach.task_models import TaskSession, WorkTask
+
+        start = datetime(2026, 6, 11, 10, 0)
+        active = TaskSession(
+            task_id="aw-coach:main.py",
+            label="main.py",
+            project="aw-coach",
+            intent="implement",
+            started_at=start,
+            accumulated_sec=180,
+            confidence=0.7,
+        )
+
+        tracker = TaskSessionTracker.from_active_session(
+            active,
+            last_update=start + timedelta(minutes=3),
+        )
+        task = WorkTask("aw-coach:main.py", "main.py", "aw-coach", "implement", 0.7)
+        session = tracker.update(task, _state(), start + timedelta(minutes=4))
+
+        assert session.started_at == start
+        assert session.accumulated_sec == 240
