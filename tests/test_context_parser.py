@@ -122,6 +122,36 @@ class TestTitleParserBrowser:
         assert ctx.project is None
         assert ctx.remote_host is None
 
+    def test_v2ex_does_not_match_x_dot_com_site(self):
+        p = TitleParser()
+        ctx = p.parse("firefox", "V2EX", url="https://v2ex.com/t/1")
+        assert ctx.site is None
+
+    def test_google_chrome_linux_app_is_browser(self):
+        p = TitleParser()
+        ctx = p.parse(
+            "Google-chrome",
+            "ChatGPT",
+            url="https://chatgpt.com/c/abc",
+        )
+        assert ctx.site == "chatgpt"
+        assert ctx.project is None
+
+    def test_internal_sites(self):
+        p = TitleParser()
+        assert (
+            p.parse("firefox", "TARS Code", url="https://code.tars-ai.com/project").site
+            == "tars_code"
+        )
+        assert (
+            p.parse(
+                "firefox",
+                "Jenkins",
+                url="https://xrobot-jenkins.tars-ai.com/job/build",
+            ).site
+            == "jenkins"
+        )
+
 
 class TestTitleParserTerminal:
     """Terminal window titles."""

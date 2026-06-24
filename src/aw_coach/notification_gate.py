@@ -99,10 +99,17 @@ class NotificationGate:
 
         return True, "ok"
 
-    def record_notify(self, kind: str, now: Optional[datetime] = None) -> None:
+    def record_notify(
+        self,
+        kind: str,
+        now: Optional[datetime] = None,
+        *,
+        consume_budget: bool = True,
+    ) -> None:
         now = _to_naive_local(now or datetime.now(timezone.utc).astimezone())
         self.reset_daily_if_needed(now)
-        self.notifications_today += 1
+        if consume_budget:
+            self.notifications_today += 1
         self.last_notify_by_type[kind] = now
 
     def record_event(self, kind: str, now: Optional[datetime] = None) -> None:

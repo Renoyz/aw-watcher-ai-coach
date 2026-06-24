@@ -67,6 +67,12 @@ PYTHONPATH=src python -m aw_coach.cli doctor
 aw-coach-daemon
 ```
 
+开发目录运行时，建议让启动脚本或 service 使用项目 venv：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m aw_coach.daemon
+```
+
 Windows 自启动：
 
 ```powershell
@@ -106,6 +112,8 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false   # 灰度开启后台 LLM 叙事摘要
 morning_brief_time = "09:00"
+notification_budget_exempt_kinds = ["summary", "daily_report", "morning_brief"]
+hourly_backfill_hours = 168      # daemon 重启后最多回填最近 7 天完整小时
 llm_timeout_seconds = 90
 
 [report.delivery]
@@ -121,6 +129,13 @@ task_confirm_daily_limit = 3
 [tasks]
 enabled = true
 project_roots = ["~/projects", "~/下载/activitywatch"]
+
+[context_capture]
+enabled = true
+interval_seconds = 60
+command_args_mode = "summary"  # off | summary | full
+capture_cwd = true
+capture_git = true
 
 [screenshot]
 enabled = false    # 默认关闭，保护隐私
@@ -146,6 +161,7 @@ enabled = false    # 默认关闭，保护隐私
 
 - ActivityWatch 事件数据保留在本地 ActivityWatch 数据库中。
 - AI 调用由配置中的后端决定。
+- 上下文采集只保存本地 cwd、Git repo/branch 和命令摘要，不读取文件内容。
 - 截图分析是可选功能，默认关闭。
 - 内置规则可以把敏感上下文标记为 `skip_screenshot`。
 - 不要提交本地数据库、报告、截图、日志或密钥。

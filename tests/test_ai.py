@@ -10,6 +10,7 @@ from aw_coach.ai.base import AIBackend, ClassificationResult
 from aw_coach.ai.cost import CostController
 from aw_coach.ai.hybrid import HybridBackend
 from aw_coach.ai.openai_backend import OpenAIBackend
+from aw_coach.ai.suggestions import _parse_response as parse_suggestion_response
 from aw_coach.collector import ActivitySlice
 from aw_coach.config import CostConfig
 from aw_coach.rules.engine import RuleEngine
@@ -95,6 +96,30 @@ class TestOpenAIBackend:
         cost = backend.estimate_cost("batch_classify", 8)
         assert cost > 0
         assert cost < 0.1  # Should be very cheap for gpt-4o-mini
+
+
+class TestAISuggestions:
+    def test_parse_chatty_json_array_response(self):
+        raw = '建议如下：\n["减少终端和浏览器反复切换。", "将飞书沟通集中到固定窗口。"]'
+
+        suggestions = parse_suggestion_response(raw)
+
+        assert suggestions == [
+            "减少终端和浏览器反复切换。",
+            "将飞书沟通集中到固定窗口。",
+        ]
+
+    def test_parse_nested_json_array_string_response(self):
+        raw = json.dumps(
+            '["减少终端和浏览器反复切换。", "将飞书沟通集中到固定窗口。"]'
+        )
+
+        suggestions = parse_suggestion_response(raw)
+
+        assert suggestions == [
+            "减少终端和浏览器反复切换。",
+            "将飞书沟通集中到固定窗口。",
+        ]
 
 
 class TestHybridBackend:

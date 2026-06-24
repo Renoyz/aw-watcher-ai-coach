@@ -23,6 +23,9 @@ def sample_analysis():
             "admin": 0.4,
         },
         hourly_scores=[(9, 85), (10, 78), (11, 62), (14, 75), (15, 55), (16, 35)],
+        task_switch_count=4,
+        task_breakdown={"api": 3.0, "docs": 1.0},
+        task_deep_work_breakdown={"api": 1.5},
     )
 
 
@@ -42,11 +45,15 @@ class TestDailyReport:
         assert "2.25" in report or "2.2" in report  # deep work
         assert "72" in report  # focus score
         assert "23" in report  # switch count
+        assert "任务切换" in report
+        assert "4" in report
 
     def test_contains_activity_breakdown(self, generator, sample_analysis):
         report = generator.generate_daily(date(2026, 5, 30), sample_analysis)
         assert "programming" in report
         assert "meeting" in report
+        assert "api" in report
+        assert "深度 1.5h" in report
 
     def test_contains_energy_curve(self, generator, sample_analysis):
         report = generator.generate_daily(date(2026, 5, 30), sample_analysis)

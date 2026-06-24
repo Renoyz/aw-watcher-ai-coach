@@ -21,6 +21,10 @@ def test_default_config_no_file():
     assert config.report.delivery.daily_report == "notify"
     assert config.report.delivery.medium_signal == "inbox"
     assert config.report.llm_timeout_seconds == 90
+    assert "summary" in config.report.notification_budget_exempt_kinds
+    assert config.report.hourly_backfill_hours == 168
+    assert config.context_capture.enabled is True
+    assert config.context_capture.command_args_mode == "summary"
 
 
 def test_partial_config_merges_with_defaults():
@@ -65,6 +69,8 @@ work_days = [1, 2, 3, 4, 5]
 daily_report_time = "22:00"
 instant_summary_interval_hours = 3
 notification_method = "cli_only"
+notification_budget_exempt_kinds = ["daily_report"]
+hourly_backfill_hours = 48
 llm_timeout_seconds = 45
 
 [report.delivery]
@@ -78,6 +84,12 @@ backend = "openai"
 [cost]
 monthly_budget_usd = 20.0
 alert_thresholds = [0.5, 0.9]
+
+[context_capture]
+enabled = true
+interval_seconds = 30
+command_args_mode = "off"
+capture_cwd = false
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(toml_content)
@@ -90,11 +102,16 @@ alert_thresholds = [0.5, 0.9]
     assert config.analysis.distraction_apps == ["youtube", "tiktok"]
     assert config.report.daily_report_time == "22:00"
     assert config.report.llm_timeout_seconds == 45
+    assert config.report.notification_budget_exempt_kinds == ["daily_report"]
+    assert config.report.hourly_backfill_hours == 48
     assert config.report.delivery.instant_summary == "both"
     assert config.report.delivery.daily_report == "inbox"
     assert config.report.delivery.medium_signal == "notify"
     assert config.ai.backend == "openai"
     assert config.cost.monthly_budget_usd == 20.0
+    assert config.context_capture.interval_seconds == 30
+    assert config.context_capture.command_args_mode == "off"
+    assert config.context_capture.capture_cwd is False
 
 
 def test_invalid_backend_raises():

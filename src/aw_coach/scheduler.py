@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-from aw_coach.analyzer import PatternAnalyzer
+from aw_coach.analyzer import ANALYSIS_SCHEMA_VERSION, PatternAnalyzer
 from aw_coach.background_summary import generate_background_summary
 from aw_coach.classifier import create_classifier
 from aw_coach.collector import DataCollector, _local_to_utc
@@ -23,6 +23,7 @@ from aw_coach.report import ReportGenerator, generate_html_dashboard
 from aw_coach.state import CoachAgentStateMachine
 
 logger = logging.getLogger(__name__)
+TASK_TRACKER_STATE_KEY = "task_tracker"
 
 if TYPE_CHECKING:
     from aw_coach.context_stack import ContextStack
@@ -79,6 +80,8 @@ class CoachScheduler:
         self._task_confirm_candidates: Dict[str, datetime] = {}
         self._task_confirm_count_date: Optional[date] = None
         self._task_confirm_count = 0
+        self._context_bucket_created = False
+        self._last_context_capture: Optional[datetime] = None
 
         # Background LLM summary worker
         self._summary_executor = ThreadPoolExecutor(
@@ -160,29 +163,32 @@ class CoachScheduler:
             switches = 0
             if len(recent) >= 2:
                 sorted_recent = sorted(recent, key=lambda s: s.end)
-                types = [
-                    engine.classify(r.primary_app, r.primary_title, r.web_url).activity_type
+                recent_rules = [
+                    engine.classify(r.primary_app, r.primary_title, r.web_url)
                     for r in sorted_recent
                 ]
-                switches = sum(
-                    1 for i in range(len(types) - 1) if types[i] != types[i + 1]
-                )
+                self._annotate_task_slices(sorted_recent, recent_rules)
+                keys = [self._semantic_switch_key(s) for s in sorted_recent]
+                if any(keys):
+                    filtered_keys = [key for key in keys if key]
+                    switches = sum(
+                        1
+                        for i in range(len(filtered_keys) - 1)
+                        if filtered_keys[i] != filtered_keys[i + 1]
+                    )
+                else:
+                    types = [r.activity_type for r in recent_rules]
+                    switches = sum(
+                        1 for i in range(len(types) - 1) if types[i] != types[i + 1]
+                    )
 
-            # --- Live process enrichment (only for the latest slice) ----
-            live_terminal_cmd: Optional[str] = None
-            if latest.primary_app.lower() in {
-                "terminal", "iterm2", "gnome-terminal", "konsole",
-                "alacritty", "wezterm", "warp", "tabby", "xterm",
-                "kitty", "windows terminal", "terminator", "tilix",
-                "hyper", "st",
-            }:
-                try:
-                    from aw_coach.process_context import get_terminal_foreground_command
-                    cmd = get_terminal_foreground_command()
-                    if cmd:
-                        live_terminal_cmd = cmd[0] if len(cmd) == 1 else f"{cmd[0]} {cmd[1]}"
-                except Exception:
-                    pass
+            # --- Live process enrichment + durable context capture --------
+            context_snapshot = self._capture_context_snapshot(now, latest)
+            live_terminal_cmd = (
+                context_snapshot.terminal_command_summary
+                if context_snapshot is not None
+                else None
+            )
             # ---------------------------------------------------------------
 
             # --- Preliminary state (for screenshot trigger decision) ------
@@ -259,6 +265,7 @@ class CoachScheduler:
                 screen_content_type=screenshot_result.content_type if screenshot_result else None,
                 history=history_records,
             )
+            self._apply_context_snapshot_to_state(state, context_snapshot)
 
             # --- Context Stack update -------------------------------------
             if self._context_stack is None:
@@ -283,6 +290,7 @@ class CoachScheduler:
                     ),
                     history=history_records,
                 )
+                self._apply_context_snapshot_to_state(state, context_snapshot)
                 # Sync context stack with corrected block time
                 self._context_stack.update(state, now)
             # ---------------------------------------------------------------
@@ -406,23 +414,49 @@ class CoachScheduler:
             )
         return self._policy_engine
 
+    @staticmethod
+    def _semantic_switch_key(s) -> Optional[str]:
+        task_id = getattr(s, "task_id", None)
+        if task_id and not str(task_id).startswith("unknown:"):
+            return str(task_id)
+        git_repo = getattr(s, "git_repo", None)
+        if git_repo:
+            return f"repo:{git_repo}:{getattr(s, 'git_branch', '') or ''}"
+        project = getattr(s, "semantic_project", None)
+        if project:
+            return f"project:{project}"
+        return None
+
+    @staticmethod
+    def _apply_context_snapshot_to_state(state, snapshot) -> None:
+        if snapshot is None:
+            return
+        if getattr(snapshot, "git_repo", None):
+            state.git_repo = snapshot.git_repo
+            state.git_branch = snapshot.git_branch
+            if not state.semantic_project:
+                state.semantic_project = snapshot.git_repo
+        if getattr(snapshot, "terminal_action", None):
+            state.semantic_action = snapshot.terminal_action
+
     def _apply_task_perception(self, state, rule, now: datetime):
         if not self.config.tasks.enabled:
             return state
-        from aw_coach.git_context import get_git_context_for_project
+        from aw_coach.git_context import GitContext, get_git_context_for_project
         from aw_coach.task_fusion import TaskFusionEngine
         from aw_coach.task_signals import TaskSignalExtractor
-        from aw_coach.task_tracker import TaskSessionTracker
 
         if self._task_signal_extractor is None:
             self._task_signal_extractor = TaskSignalExtractor(self.config.tasks)
         if self._task_fusion is None:
             self._task_fusion = TaskFusionEngine()
         if self._task_tracker is None:
-            self._task_tracker = TaskSessionTracker()
+            self._task_tracker = self._restore_task_tracker()
 
         git_ctx = None
-        if state.semantic_project:
+        if state.git_repo:
+            git_ctx = GitContext(repo_name=state.git_repo, branch=state.git_branch)
+        elif state.semantic_project:
             try:
                 git_ctx = get_git_context_for_project(
                     state.semantic_project,
@@ -443,12 +477,40 @@ class CoachScheduler:
         )
         task = self._task_fusion.resolve(candidate)
         self._task_tracker.update(task, state, now)
+        self._persist_task_tracker()
 
         state.task_id = task.task_id
         state.task_label = task.label
         state.task_intent = task.intent
         state.task_confidence = task.confidence
         return state
+
+    def _restore_task_tracker(self):
+        from aw_coach.task_tracker import TaskSessionTracker
+
+        raw = self.storage.get_scheduler_state(TASK_TRACKER_STATE_KEY)
+        if raw:
+            try:
+                return TaskSessionTracker.from_json(raw)
+            except Exception:
+                logger.debug("Failed to restore task tracker, starting fresh", exc_info=True)
+        return TaskSessionTracker()
+
+    def _persist_task_tracker(self) -> None:
+        tasks_config = getattr(getattr(self, "config", None), "tasks", None)
+        if (
+            tasks_config is None
+            or not getattr(tasks_config, "enabled", False)
+            or self._task_tracker is None
+        ):
+            return
+        try:
+            self.storage.set_scheduler_state(
+                TASK_TRACKER_STATE_KEY,
+                self._task_tracker.to_json(),
+            )
+        except Exception:
+            logger.debug("Task tracker persist failed", exc_info=True)
 
     @staticmethod
     def _format_signal_evidence(state) -> str:
@@ -605,17 +667,26 @@ class CoachScheduler:
         wants_notify = delivery in {"notify", "both"}
         wants_inbox = delivery in {"inbox", "both"}
         inbox_reason = reason
+        require_budget = self._requires_notification_budget(kind, severity)
 
         if wants_notify:
             if not self._should_notify():
                 inbox_reason = "通知被抑制: cli_only"
                 self._record_delivery(kind, "notify", "suppressed", "cli_only", title)
             else:
-                allowed, deny_reason = self._notification_gate.allow_notify(kind, now=now)
+                allowed, deny_reason = self._notification_gate.allow_notify(
+                    kind,
+                    now=now,
+                    require_budget=require_budget,
+                )
                 if allowed:
                     sent = send_notification(title, body, detail_url=detail_url)
                     if sent:
-                        self._notification_gate.record_notify(kind, now)
+                        self._notification_gate.record_notify(
+                            kind,
+                            now,
+                            consume_budget=require_budget,
+                        )
                         result["notified"] = True
                         self._record_delivery(kind, "notify", "sent", reason, title)
                     else:
@@ -639,6 +710,12 @@ class CoachScheduler:
                 self._record_delivery(kind, "inbox", "failed", "save_failed", title)
                 logger.debug("Inbox save failed", exc_info=True)
         return result
+
+    def _requires_notification_budget(self, kind: str, severity: float) -> bool:
+        if severity >= 0.8:
+            return False
+        exempt = set(getattr(self.config.report, "notification_budget_exempt_kinds", []))
+        return kind not in exempt
 
     def _deliver_summary(
         self,
@@ -717,6 +794,10 @@ class CoachScheduler:
     def bucket_id(self) -> str:
         return f"ai-coach_{self.collector.hostname}"
 
+    @property
+    def context_bucket_id(self) -> str:
+        return f"aw-coach-context_{self.collector.hostname}"
+
     def _ensure_bucket(self) -> None:
         if self._bucket_created:
             return
@@ -729,6 +810,92 @@ class CoachScheduler:
             self._bucket_created = True
         except Exception:
             self._bucket_created = True
+
+    def _ensure_context_bucket(self) -> None:
+        if self._context_bucket_created:
+            return
+        try:
+            self.collector.client.create_bucket(
+                self.context_bucket_id,
+                event_type="aw.coach.context",
+                queued=False,
+            )
+            self._context_bucket_created = True
+        except Exception:
+            self._context_bucket_created = True
+
+    def _capture_context_snapshot(self, now: datetime, latest):
+        cfg = getattr(self.config, "context_capture", None)
+        if cfg is None or not cfg.enabled:
+            return None
+
+        interval = max(10, int(cfg.interval_seconds))
+        if (
+            self._last_context_capture is not None
+            and (now - self._last_context_capture).total_seconds() < interval
+        ):
+            return None
+        self._last_context_capture = now
+
+        try:
+            from aw_coach.process_context import capture_process_context
+
+            snapshot = capture_process_context(
+                active_app=latest.primary_app,
+                command_args_mode=cfg.command_args_mode,
+                capture_cwd=cfg.capture_cwd,
+                capture_git=cfg.capture_git,
+            )
+        except Exception:
+            logger.debug("Context capture failed", exc_info=True)
+            return None
+
+        if snapshot is None:
+            return None
+
+        if not any(
+            [
+                snapshot.process_name,
+                snapshot.process_cwd,
+                snapshot.git_repo,
+                snapshot.terminal_command_summary,
+            ]
+        ):
+            return snapshot
+
+        try:
+            from aw_core.models import Event
+
+            self._ensure_context_bucket()
+            event = Event(
+                timestamp=_local_to_utc(now - timedelta(seconds=interval)),
+                duration=timedelta(seconds=interval),
+                data={
+                    "schema_version": 1,
+                    "type": "context_snapshot",
+                    "process_name": snapshot.process_name,
+                    "process_cwd": snapshot.process_cwd,
+                    "git_repo": snapshot.git_repo,
+                    "git_branch": snapshot.git_branch,
+                    "terminal_command_summary": snapshot.terminal_command_summary,
+                    "terminal_action": snapshot.terminal_action,
+                },
+            )
+            self.collector.client.insert_event(self.context_bucket_id, event)
+        except Exception:
+            logger.debug("Context snapshot write failed", exc_info=True)
+
+        return snapshot
+
+    def _annotate_task_slices(self, slices, rules) -> None:
+        if not self.config.tasks.enabled:
+            return
+        try:
+            from aw_coach.task_signals import annotate_task_slices
+
+            annotate_task_slices(slices, rules, self.config.tasks)
+        except Exception:
+            logger.debug("Historical task annotation failed", exc_info=True)
 
     def _restore_last_summary(self) -> datetime:
         """Restore last_summary from persistent storage."""
@@ -776,6 +943,7 @@ class CoachScheduler:
         last_hourly = self._restore_last_hourly(datetime.now())
         last_summary = self._restore_last_summary()
         last_hourly = self._catch_up_hourly(last_hourly, datetime.now())
+        self._reconcile_recent_hourly(datetime.now())
         self._save_last_hourly(last_hourly)
         logger.info(f"  last_hourly restored: {last_hourly.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"  last_summary restored: {last_summary.strftime('%H:%M')}")
@@ -854,7 +1022,13 @@ class CoachScheduler:
                     f"Flushing partial hour: "
                     f"{last_boundary.strftime('%H:%M')}-{now.strftime('%H:%M')}"
                 )
-                self._hourly_analyze(last_boundary, now, allow_llm=False)
+                self._hourly_analyze(
+                    last_boundary,
+                    now,
+                    allow_llm=False,
+                    event_type="partial_hour_analysis",
+                )
+            self._persist_task_tracker()
         except Exception as e:
             logger.warning(f"Flush on shutdown failed (non-fatal): {e}")
         try:
@@ -869,7 +1043,7 @@ class CoachScheduler:
         if last_hourly >= target:
             return last_hourly
 
-        max_backfill_hours = 24
+        max_backfill_hours = max(1, self.config.report.hourly_backfill_hours)
         earliest = target - timedelta(hours=max_backfill_hours)
         if last_hourly < earliest:
             logger.info(
@@ -881,12 +1055,29 @@ class CoachScheduler:
         current = last_hourly
         while current < target:
             next_hour = current + timedelta(hours=1)
-            if not self._hourly_analyze(current, next_hour):
+            if not self._hourly_analyze(current, next_hour, allow_llm=False):
                 return current
             current = next_hour
             self._save_last_hourly(current)
 
         return current
+
+    def _reconcile_recent_hourly(self, now: datetime) -> None:
+        """Fill missing completed hourly events in the configured lookback window."""
+        target = self._prev_hour_boundary(now)
+        max_backfill_hours = max(1, self.config.report.hourly_backfill_hours)
+        current = target - timedelta(hours=max_backfill_hours)
+        while current < target:
+            next_hour = current + timedelta(hours=1)
+            if not self._event_exists("hourly_analysis", current, next_hour):
+                if not self._hourly_analyze(current, next_hour, allow_llm=False):
+                    logger.debug(
+                        "Hourly reconciliation stopped at %s-%s",
+                        current.isoformat(),
+                        next_hour.isoformat(),
+                    )
+                    return
+            current = next_hour
 
     def _hourly_analyze(
         self,
@@ -894,6 +1085,7 @@ class CoachScheduler:
         hour_end: datetime,
         *,
         allow_llm: bool = True,
+        event_type: str = "hourly_analysis",
     ) -> bool:
         try:
             slices = self.collector.fetch_range(hour_start, hour_end)
@@ -905,6 +1097,7 @@ class CoachScheduler:
             return True
 
         rules = self._classify_slices(slices, allow_llm=allow_llm)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         # Determine dominant activity type
@@ -916,10 +1109,11 @@ class CoachScheduler:
 
         # Write to ai-coach bucket
         self._ensure_bucket()
-        if self._event_exists("hourly_analysis", hour_start, hour_end):
+        if self._event_exists(event_type, hour_start, hour_end):
             logger.info(
-                f"Hourly analysis already exists: {hour_start.strftime('%H:%M')}-"
-                f"{hour_end.strftime('%H:%M')}"
+                f"Hourly analysis already exists: "
+                f"{hour_start.strftime('%Y-%m-%d %H:%M')}-"
+                f"{hour_end.strftime('%Y-%m-%d %H:%M')}"
             )
             return True
 
@@ -930,8 +1124,8 @@ class CoachScheduler:
                 timestamp=_local_to_utc(hour_start),
                 duration=timedelta(seconds=int((hour_end - hour_start).total_seconds())),
                 data={
-                    "schema_version": 2,
-                    "type": "hourly_analysis",
+                    "schema_version": ANALYSIS_SCHEMA_VERSION,
+                    "type": event_type,
                     "period_start": hour_start.isoformat(),
                     "period_end": hour_end.isoformat(),
                     "activity_type": top_type,
@@ -939,6 +1133,7 @@ class CoachScheduler:
                     "classification_method": method,
                     "focus_score": analysis.focus_score,
                     "switch_count": analysis.switch_count,
+                    "task_switch_count": analysis.task_switch_count,
                     "effective_hours": round(analysis.effective_hours, 3),
                     "deep_work_hours": round(analysis.deep_work_hours, 3),
                     "productivity_score": analysis.productivity_score,
@@ -946,12 +1141,20 @@ class CoachScheduler:
                     "activity_breakdown": {
                         k: round(v, 3) for k, v in analysis.activity_breakdown.items()
                     },
+                    "task_breakdown": {
+                        k: round(v, 3) for k, v in analysis.task_breakdown.items()
+                    },
+                    "task_deep_work_breakdown": {
+                        k: round(v, 3)
+                        for k, v in analysis.task_deep_work_breakdown.items()
+                    },
                 },
             )
             self.collector.client.insert_event(self.bucket_id, event)
             logger.info(
-                f"Hourly analysis written: {hour_start.strftime('%H:%M')}-"
-                f"{hour_end.strftime('%H:%M')} "
+                f"Hourly analysis written: "
+                f"{hour_start.strftime('%Y-%m-%d %H:%M')}-"
+                f"{hour_end.strftime('%Y-%m-%d %H:%M')} "
                 f"effective={analysis.effective_hours:.1f}h focus={analysis.focus_score}"
             )
         except Exception as e:
@@ -1000,6 +1203,11 @@ class CoachScheduler:
         for event in events:
             data = getattr(event, "data", {})
             if data.get("type") != event_type:
+                continue
+            if (
+                event_type == "hourly_analysis"
+                and data.get("schema_version", 0) < ANALYSIS_SCHEMA_VERSION
+            ):
                 continue
             if data.get("period_start") == target_start and data.get("period_end") == target_end:
                 return True
@@ -1228,6 +1436,7 @@ class CoachScheduler:
             return
 
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         detail_url = None
@@ -1277,6 +1486,7 @@ class CoachScheduler:
         if not slices:
             return
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
         fallback = self._build_rule_summary_body(analysis, (now - start).total_seconds() / 3600)
         self._submit_background_summary(
@@ -1303,6 +1513,7 @@ class CoachScheduler:
             return False
 
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         use_ai = self.config.report.background_ai_summary and self.config.ai.backend != "rule_only"
@@ -1310,7 +1521,7 @@ class CoachScheduler:
         self._persist_task_sessions_for_day(report_date)
         task_breakdown = None
         if self.config.tasks.enabled:
-            task_breakdown = {
+            task_breakdown = analysis.task_breakdown or {
                 row["label"]: row["total_sec"] / 3600
                 for row in self.storage.get_task_daily_summary(report_date.isoformat())
             }
@@ -1352,6 +1563,7 @@ class CoachScheduler:
                     "deep_work_hours": round(analysis.deep_work_hours, 2),
                     "focus_score": analysis.focus_score,
                     "switch_count": analysis.switch_count,
+                    "task_switch_count": analysis.task_switch_count,
                 },
             )
             self.collector.client.insert_event(self.bucket_id, event)
@@ -1390,6 +1602,7 @@ class CoachScheduler:
                     self._cron_runner.mark_run(job, now)
                     continue
                 rules = self._classify_slices(slices)
+                self._annotate_task_slices(slices, rules)
                 analysis = self.analyzer.analyze(slices, rules)
                 fallback = self._build_rule_summary_body(analysis, 4)
                 title = f"AI Coach · {job.template}"
@@ -1445,6 +1658,7 @@ class CoachScheduler:
                 )
             except Exception:
                 logger.debug("Task daily summary persist failed", exc_info=True)
+        self._persist_task_tracker()
 
     def _persist_task_sessions_for_day(self, report_date: date) -> None:
         if not self.config.tasks.enabled or self._task_tracker is None:

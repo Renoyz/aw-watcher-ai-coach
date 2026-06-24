@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from aw_coach.analyzer import AnalysisResult
 from aw_coach.config import Config
@@ -156,34 +156,93 @@ def _build_prompt(
 7. 直接返回 JSON 数组格式: ["建议1", "建议2", ...]"""
 
 
-def _parse_response(raw: str) -> List[str]:
-    """Parse LLM response into list of suggestion strings."""
-    text = raw.strip()
-    # Extract JSON from markdown code block if present
+def _json_candidates(text: str) -> List[str]:
+    """Return likely JSON payloads from a sometimes-chatty LLM response."""
+    candidates = [text]
+
     if "```" in text:
         parts = text.split("```")
         for part in parts:
             clean = part.strip()
-            if clean.startswith("[") and clean.endswith("]"):
-                text = clean
-                break
-            elif "[" in clean and "]" in clean:
-                start = clean.find("[")
-                end = clean.rfind("]")
-                if start != -1 and end != -1:
-                    text = clean[start : end + 1]
-                    break
+            if clean:
+                candidates.append(clean)
 
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            return [str(item).strip() for item in data if item]
-        elif isinstance(data, dict):
-            for key in ("suggestions", "建议", "result", "results"):
-                if key in data and isinstance(data[key], list):
-                    return [str(s).strip() for s in data[key] if s]
-    except (json.JSONDecodeError, TypeError):
-        pass
+    for open_char, close_char in (("[", "]"), ("{", "}")):
+        start = text.find(open_char)
+        end = text.rfind(close_char)
+        if start != -1 and end > start:
+            candidates.append(text[start : end + 1])
+
+    # Preserve order while removing duplicates.
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in seen:
+            unique.append(candidate)
+            seen.add(candidate)
+    return unique
+
+
+def _coerce_suggestions(data: Any) -> List[str]:
+    """Flatten common LLM response shapes into suggestion strings."""
+    if data is None:
+        return []
+
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return []
+        if text.startswith(("[", "{")):
+            try:
+                return _coerce_suggestions(json.loads(text))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return [text]
+
+    if isinstance(data, list):
+        suggestions: List[str] = []
+        for item in data:
+            suggestions.extend(_coerce_suggestions(item))
+        return suggestions
+
+    if isinstance(data, dict):
+        for key in ("suggestions", "建议", "result", "results"):
+            if key in data:
+                return _coerce_suggestions(data[key])
+        return []
+
+    text = str(data).strip()
+    return [text] if text else []
+
+
+def _clean_suggestions(suggestions: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    for suggestion in suggestions:
+        text = suggestion.strip()
+        if not text:
+            continue
+        if text.startswith(("- ", "* ", "• ")):
+            text = text[2:].strip()
+        elif len(text) > 2 and text[0].isdigit() and text[1:3] in (". ", "、", ") "):
+            text = text[3:].strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned[:5]
+
+
+def _parse_response(raw: str) -> List[str]:
+    """Parse LLM response into list of suggestion strings."""
+    text = raw.strip()
+
+    for candidate in _json_candidates(text):
+        try:
+            suggestions = _coerce_suggestions(json.loads(candidate))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        cleaned = _clean_suggestions(suggestions)
+        if cleaned:
+            return cleaned
 
     # Fallback: line-by-line extraction
     suggestions = []
@@ -196,10 +255,15 @@ def _parse_response(raw: str) -> List[str]:
             line = line[2:]
         elif len(line) > 2 and line[0].isdigit() and line[1:3] in (". ", "、", ") "):
             line = line[3:].strip()
+        if line.startswith(("[", "{")):
+            nested = _clean_suggestions(_coerce_suggestions(line))
+            if nested:
+                suggestions.extend(nested)
+                continue
         if len(line) > 10:
             suggestions.append(line)
 
-    return suggestions[:5]
+    return _clean_suggestions(suggestions)
 
 
 def _fallback_suggestions(analysis: AnalysisResult, is_weekly: bool) -> List[str]:

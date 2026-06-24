@@ -94,6 +94,13 @@ class TitleParser:
         "google.com": "google.com",
         "docs.google.com": "google_docs",
         "mail.google.com": "gmail",
+        "chatgpt.com": "chatgpt",
+        "claude.ai": "claude",
+        "gemini.google.com": "gemini",
+        "kimi.com": "kimi",
+        "code.tars-ai.com": "tars_code",
+        "xrobot-jenkins.tars-ai.com": "jenkins",
+        "tarsrobot.feishu.cn": "feishu_docs",
     }
 
     # Title/URL keywords → action hint
@@ -129,6 +136,8 @@ class TitleParser:
     _BROWSER_APPS = frozenset(
         [
             "chrome",
+            "google-chrome",
+            "google-chrome-stable",
             "chromium",
             "firefox",
             "firefox_firefox",
@@ -400,7 +409,7 @@ class TitleParser:
             return cls._SITE_PATTERNS[domain]
         # Sub-domain match (e.g. mycompany.atlassian.net)
         for pattern, site in cls._SITE_PATTERNS.items():
-            if pattern in domain:
+            if domain == pattern or domain.endswith(f".{pattern}"):
                 return site
         return None
 

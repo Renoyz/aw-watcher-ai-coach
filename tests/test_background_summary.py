@@ -9,10 +9,19 @@ from typing import Optional
 
 from aw_coach.analyzer import AnalysisResult
 from aw_coach.background_summary import build_background_summary_prompt, should_silent_summary
-from aw_coach.config import Config, DeliveryConfig, PolicyConfig, ReportConfig
+from aw_coach.config import (
+    Config,
+    ContextCaptureConfig,
+    DeliveryConfig,
+    PolicyConfig,
+    ReportConfig,
+    TasksConfig,
+)
 from aw_coach.notification_gate import NotificationGate
 from aw_coach.scheduler import CoachScheduler
 from aw_coach.storage import Storage
+from aw_coach.task_models import WorkTask
+from aw_coach.task_tracker import TaskSessionTracker
 
 
 def _analysis(**kwargs) -> AnalysisResult:
@@ -157,6 +166,36 @@ class TestBackgroundSummary:
         assert logs[0]["channel"] == "notify"
         assert logs[0]["status"] == "sent"
 
+    def test_budget_exempt_summary_does_not_block_daily_report(
+        self, tmp_path, monkeypatch
+    ):
+        scheduler = _scheduler_for_delivery(tmp_path)
+        monkeypatch.setattr(
+            "aw_coach.scheduler.send_notification",
+            lambda title, body, detail_url=None: True,
+        )
+        now = datetime(2026, 6, 17, 10, 0)
+
+        for idx in range(8):
+            scheduler._deliver_summary(
+                "summary",
+                f"AI Coach 摘要 {idx}",
+                "body",
+                now=now + timedelta(hours=idx),
+            )
+        scheduler._deliver_summary(
+            "daily_report",
+            "AI Coach 日报",
+            "body",
+            now=now + timedelta(hours=9),
+        )
+
+        logs = scheduler.storage.get_recent_delivery_logs(limit=1)
+        assert logs[0]["kind"] == "daily_report"
+        assert logs[0]["channel"] == "notify"
+        assert logs[0]["status"] == "sent"
+        assert scheduler._notification_gate.notifications_today == 0
+
     def test_notify_suppression_falls_back_to_inbox(self, tmp_path):
         scheduler = _scheduler_for_delivery(
             tmp_path,
@@ -220,6 +259,104 @@ class TestBackgroundSummary:
 
         assert len(delivered) == 1
         assert delivered[0]["kind"] == "task_confirm"
+
+    def test_partial_hour_shutdown_uses_distinct_event_type(self, tmp_path, monkeypatch):
+        scheduler = CoachScheduler.__new__(CoachScheduler)
+        called = []
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 6, 17, 10, 5, 0)
+                return value if tz is None else value.replace(tzinfo=tz)
+
+        monkeypatch.setattr("aw_coach.scheduler.datetime", FixedDateTime)
+        scheduler._save_last_summary = lambda now: None
+        scheduler._hourly_analyze = lambda start, end, **kwargs: called.append(
+            (start, end, kwargs)
+        ) or True
+        scheduler._summary_executor = SimpleNamespace(
+            shutdown=lambda wait=False, cancel_futures=True: None
+        )
+
+        scheduler._shutdown(None, None)
+
+        assert called
+        assert called[0][2]["allow_llm"] is False
+        assert called[0][2]["event_type"] == "partial_hour_analysis"
+
+    def test_context_snapshot_written_to_context_bucket(self, monkeypatch):
+        scheduler = CoachScheduler.__new__(CoachScheduler)
+        scheduler.config = SimpleNamespace(
+            context_capture=ContextCaptureConfig(interval_seconds=60)
+        )
+        scheduler._context_bucket_created = False
+        scheduler._last_context_capture = None
+        inserted = []
+        created = []
+
+        class Client:
+            def create_bucket(self, bucket_id, event_type, queued=False):
+                created.append((bucket_id, event_type, queued))
+
+            def insert_event(self, bucket_id, event):
+                inserted.append((bucket_id, event))
+
+        scheduler._collector = SimpleNamespace(
+            hostname="host",
+            client=Client(),
+        )
+        snapshot = SimpleNamespace(
+            process_name="pytest",
+            process_cwd="/repo",
+            git_repo="aw-coach",
+            git_branch="feat/context",
+            terminal_command_summary="pytest tests",
+            terminal_action="testing",
+        )
+        monkeypatch.setattr(
+            "aw_coach.process_context.capture_process_context",
+            lambda **kwargs: snapshot,
+        )
+        latest = SimpleNamespace(primary_app="gnome-terminal")
+
+        result = scheduler._capture_context_snapshot(
+            datetime(2026, 6, 17, 10, 0),
+            latest,
+        )
+
+        assert result is snapshot
+        assert created[0][0] == "aw-coach-context_host"
+        assert inserted[0][0] == "aw-coach-context_host"
+        assert inserted[0][1].data["type"] == "context_snapshot"
+        assert inserted[0][1].data["git_repo"] == "aw-coach"
+
+    def test_task_tracker_state_persists_through_scheduler_state(self, tmp_path):
+        scheduler = CoachScheduler.__new__(CoachScheduler)
+        scheduler.config = SimpleNamespace(
+            tasks=TasksConfig(enabled=True),
+            db_path=tmp_path / "coach.db",
+        )
+        scheduler._storage = Storage(scheduler.config.db_path)
+        tracker = TaskSessionTracker()
+        start = datetime(2026, 6, 17, 10, 0)
+        task = WorkTask("aw-coach:main", "main", "aw-coach", "implement", 0.8)
+        state = SimpleNamespace(
+            likely_mode="coding",
+            detected_signal=None,
+            risk_level="normal",
+        )
+        tracker.update(task, state, start)
+        scheduler._task_tracker = tracker
+
+        scheduler._persist_task_tracker()
+
+        scheduler._task_tracker = None
+        restored = scheduler._restore_task_tracker()
+
+        assert restored.current_session is not None
+        assert restored.current_session.task_id == "aw-coach:main"
+        assert restored.current_session.started_at == start
 
 
 def _scheduler_for_delivery(

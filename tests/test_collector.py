@@ -2,7 +2,8 @@
 
 from datetime import datetime, timedelta
 
-from aw_coach.collector import ActivitySlice, merge_events
+from aw_coach.collector import ActivitySlice, DataCollector, merge_events
+from aw_coach.git_context import GitContext
 
 
 def _make_window_event(ts: datetime, duration_sec: float, app: str, title: str):
@@ -129,6 +130,95 @@ class TestMergeEvents:
         slices = merge_events(windows, afk)
 
         assert slices[0].web_url == "https://github.com"
+
+    def test_google_chrome_gets_web_url_enrichment(self):
+        t0 = datetime(2026, 5, 30, 9, 0)
+        windows = [_make_window_event(t0, 300, "Google-chrome", "ChatGPT")]
+        afk = [_make_afk_event(t0, 300, "not-afk")]
+        web = [{
+            "timestamp": t0,
+            "duration": timedelta(seconds=300),
+            "data": {"url": "https://chatgpt.com/c/abc"},
+        }]
+
+        slices = merge_events(windows, afk, web_events=web)
+
+        assert slices[0].web_url == "https://chatgpt.com/c/abc"
+
+    def test_context_events_enrich_slices_by_overlap(self):
+        t0 = datetime(2026, 5, 30, 9, 0)
+        windows = [_make_window_event(t0, 300, "gnome-terminal", "pytest")]
+        afk = [_make_afk_event(t0, 300, "not-afk")]
+        context = [{
+            "timestamp": t0 + timedelta(seconds=30),
+            "duration": timedelta(seconds=120),
+            "data": {
+                "type": "context_snapshot",
+                "process_name": "pytest",
+                "process_cwd": "/home/yz/code/aw-coach",
+                "git_repo": "aw-coach",
+                "git_branch": "feat/context",
+                "terminal_command_summary": "pytest tests",
+                "terminal_action": "testing",
+            },
+        }]
+
+        slices = merge_events(windows, afk, context_events=context)
+
+        assert slices[0].process_name == "pytest"
+        assert slices[0].process_cwd == "/home/yz/code/aw-coach"
+        assert slices[0].git_repo == "aw-coach"
+        assert slices[0].git_branch == "feat/context"
+        assert slices[0].terminal_command == "pytest tests"
+        assert slices[0].terminal_action == "testing"
+
+    def test_context_git_snapshot_is_not_overwritten_by_current_cwd(self, monkeypatch):
+        monkeypatch.setattr(
+            "aw_coach.git_context.get_git_context_from_path",
+            lambda _: GitContext(repo_name="current-repo", branch="current-branch"),
+        )
+
+        t0 = datetime(2026, 5, 30, 9, 0)
+        windows = [_make_window_event(t0, 300, "gnome-terminal", "pytest")]
+        afk = [_make_afk_event(t0, 300, "not-afk")]
+        context = [{
+            "timestamp": t0,
+            "duration": timedelta(seconds=300),
+            "data": {
+                "type": "context_snapshot",
+                "process_cwd": "/home/yz/code/aw-coach",
+                "git_repo": "historical-repo",
+                "git_branch": "historical-branch",
+            },
+        }]
+
+        slices = merge_events(windows, afk, context_events=context)
+
+        assert slices[0].git_repo == "historical-repo"
+        assert slices[0].git_branch == "historical-branch"
+
+    def test_missing_context_bucket_does_not_fetch_events(self):
+        class FakeClient:
+            def __init__(self):
+                self.event_calls = 0
+
+            def get_buckets(self):
+                return {
+                    "aw-watcher-window_host": {},
+                    "aw-watcher-afk_host": {},
+                }
+
+            def get_events(self, *args, **kwargs):
+                self.event_calls += 1
+                raise AssertionError("context bucket should not be fetched")
+
+        client = FakeClient()
+        collector = DataCollector(client=client)
+        collector._hostname = "host"
+
+        t0 = datetime(2026, 5, 30, 9, 0)
+        assert collector._fetch_context_events(t0, t0 + timedelta(minutes=1)) == []
+        assert client.event_calls == 0
 
 
 class TestHeartbeatMerging:

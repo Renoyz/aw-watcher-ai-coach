@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from aw_coach.enriched_state import SemanticWorkState
 from aw_coach.task_models import TaskSession, WorkTask
@@ -113,3 +114,78 @@ class TaskSessionTracker:
         drained = self._completed
         self._completed = []
         return drained
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current": self._session_to_dict(self._current),
+            "completed": [
+                self._session_to_dict(session) for session in self._completed
+            ],
+            "last_update": self._last_update.isoformat() if self._last_update else None,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "TaskSessionTracker":
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return cls()
+        tracker = cls()
+        tracker._current = cls._session_from_dict(data.get("current"))
+        completed = data.get("completed") or []
+        if isinstance(completed, list):
+            tracker._completed = [
+                session
+                for session in (cls._session_from_dict(item) for item in completed)
+                if session is not None
+            ]
+        tracker._last_update = cls._parse_datetime(data.get("last_update"))
+        return tracker
+
+    @staticmethod
+    def _session_to_dict(session: Optional[TaskSession]) -> Optional[Dict[str, Any]]:
+        if session is None:
+            return None
+        return session.to_dict()
+
+    @classmethod
+    def _session_from_dict(cls, data: Any) -> Optional[TaskSession]:
+        if not isinstance(data, dict):
+            return None
+        started_at = cls._parse_datetime(data.get("started_at"))
+        if started_at is None:
+            return None
+
+        modes = data.get("modes") or []
+        blockers = data.get("blockers") or []
+        if not isinstance(modes, list):
+            modes = []
+        if not isinstance(blockers, list):
+            blockers = []
+
+        return TaskSession(
+            task_id=str(data.get("task_id") or "unknown:unknown"),
+            label=str(data.get("label") or data.get("task_id") or "unknown"),
+            project=data.get("project"),
+            intent=str(data.get("intent") or "unknown"),
+            started_at=started_at,
+            ended_at=cls._parse_datetime(data.get("ended_at")),
+            accumulated_sec=float(data.get("accumulated_sec") or 0.0),
+            modes=[str(mode) for mode in modes],
+            blockers=[str(blocker) for blocker in blockers],
+            outcome=str(data.get("outcome") or "in_progress"),
+            confidence=float(data.get("confidence") or 0.0),
+        )
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None

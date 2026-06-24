@@ -69,6 +69,13 @@ Run the daemon directly:
 aw-coach-daemon
 ```
 
+When running from a development checkout, point the service or wrapper at the
+project virtualenv:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m aw_coach.daemon
+```
+
 On Windows, install and inspect autostart:
 
 ```powershell
@@ -109,6 +116,8 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false
 morning_brief_time = "09:00"
+notification_budget_exempt_kinds = ["summary", "daily_report", "morning_brief"]
+hourly_backfill_hours = 168
 llm_timeout_seconds = 90
 
 [report.delivery]
@@ -124,6 +133,13 @@ task_confirm_daily_limit = 3
 [tasks]
 enabled = true
 project_roots = ["~/projects", "~/下载/activitywatch"]
+
+[context_capture]
+enabled = true
+interval_seconds = 60
+command_args_mode = "summary"  # off | summary | full
+capture_cwd = true
+capture_git = true
 
 [screenshot]
 enabled = false
@@ -151,6 +167,8 @@ This tool is local-first, but it can still process sensitive local activity meta
 
 - ActivityWatch event data stays in your local ActivityWatch database.
 - AI calls are controlled by the configured backend.
+- Context capture stores local cwd, Git repo/branch, and a command summary only;
+  it does not read file contents.
 - Screenshot analysis is optional and disabled by default.
 - Built-in rules can mark sensitive contexts as `skip_screenshot`.
 - Do not commit local databases, reports, screenshots, logs, or secrets.

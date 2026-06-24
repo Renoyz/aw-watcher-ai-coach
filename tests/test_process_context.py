@@ -10,8 +10,11 @@ from unittest.mock import MagicMock, patch
 from aw_coach.process_context import (
     _find_terminal_foreground_cmd,
     _parse_ps_output,
+    capture_process_context,
     get_terminal_foreground_command,
     infer_action_from_command,
+    is_terminal_app,
+    summarize_command,
 )
 
 # ---------------------------------------------------------------------------
@@ -155,3 +158,61 @@ class TestInferActionFromCommand:
         assert infer_action_from_command("nvim") == "editing"
         assert infer_action_from_command("vim") == "editing"
         assert infer_action_from_command("hx") == "editing"
+
+
+class TestCommandSummary:
+    def test_summary_omits_file_args(self):
+        assert summarize_command("python", "python -m pytest tests/test_x.py") == "python -m pytest"
+        assert summarize_command("git", "git commit -m secret") == "git commit"
+        assert summarize_command("rg", "rg private-token src/") == "rg"
+
+    def test_mode_off(self):
+        assert summarize_command("pytest", "pytest -q", mode="off") is None
+
+    def test_terminal_app_detection(self):
+        assert is_terminal_app("gnome-terminal") is True
+        assert is_terminal_app("Google Chrome") is False
+
+
+class TestCaptureProcessContext:
+    def test_non_terminal_app_skips_capture(self, monkeypatch):
+        called = False
+
+        def fake_processes():
+            nonlocal called
+            called = True
+            return []
+
+        monkeypatch.setattr("aw_coach.process_context._get_user_processes", fake_processes)
+        assert capture_process_context(active_app="chrome") is None
+        assert called is False
+
+    def test_captures_cwd_git_and_summary(self, monkeypatch):
+        from aw_coach.git_context import GitContext
+
+        procs = [
+            (1000, 1, "gnome-terminal-server", "gnome-terminal-server"),
+            (1001, 1000, "bash", "bash"),
+            (1002, 1001, "pytest", "pytest tests/test_app.py"),
+        ]
+        monkeypatch.setattr(
+            "aw_coach.process_context._get_user_processes", lambda: procs
+        )
+        monkeypatch.setattr(
+            "aw_coach.process_context._read_process_cwd",
+            lambda pid: "/home/yz/code/aw-coach",
+        )
+        monkeypatch.setattr(
+            "aw_coach.git_context.get_git_context_from_path",
+            lambda cwd: GitContext(repo_name="aw-coach", branch="feat/context"),
+        )
+
+        snapshot = capture_process_context(active_app="gnome-terminal")
+
+        assert snapshot is not None
+        assert snapshot.process_name == "pytest"
+        assert snapshot.process_cwd == "/home/yz/code/aw-coach"
+        assert snapshot.git_repo == "aw-coach"
+        assert snapshot.git_branch == "feat/context"
+        assert snapshot.terminal_command_summary == "pytest"
+        assert snapshot.terminal_action == "testing"

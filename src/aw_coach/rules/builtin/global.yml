@@ -1,7 +1,7 @@
 rules:
   # === IDEs & Editors ===
   - name: vscode
-    match_apps: ["code", "code - insiders", "vscodium", "cursor"]
+    match_apps: ["code", "code - insiders", "vscodium", "cursor", "notepad++", "notepad-plus-plus.exe"]
     default_type: programming
     confidence: 0.90
     sub_rules:
@@ -87,9 +87,19 @@ rules:
         type: ai_assisted
         confidence: 0.92
         weight: 0.9
-      - match_urls: ["github.com/copilot", "claude.ai", "chatgpt.com", "chat.openai.com", "cursor.com", "aider.chat"]
+      - match_urls: ["github.com/copilot", "claude.ai", "chatgpt.com", "chat.openai.com", "gemini.google.com", "kimi.com", "www.kimi.com", "cursor.com", "aider.chat"]
         type: ai_assisted
         confidence: 0.90
+        weight: 0.9
+
+      # --- Internal engineering tools ---
+      - match_urls: ["code.tars-ai.com", "xrobot-jenkins.tars-ai.com", "10.88.155.207:9004", "10.88.163.209:9004", "10.88.163.190:9004", "10.88.163.166:9004", "10.88.163.208:9004", "10.88.163.156:9004", "127.0.0.1:9004"]
+        type: programming
+        confidence: 0.82
+        weight: 1.0
+      - match_urls: ["tarsrobot.feishu.cn"]
+        type: writing
+        confidence: 0.82
         weight: 0.9
 
       # --- Documentation & Research (high-confidence URL matches) ---

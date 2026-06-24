@@ -46,6 +46,44 @@ def _read_raw_config(path: Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
+def _event_duration_seconds(event: Any) -> float:
+    duration = getattr(event, "duration", 0) or 0
+    if hasattr(duration, "total_seconds"):
+        return float(duration.total_seconds())
+    try:
+        return float(duration)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _event_schema_version(event: Any) -> int:
+    data = getattr(event, "data", {}) or {}
+    try:
+        return int(data.get("schema_version", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dedupe_hourly_analysis_events(events: List[Any]) -> List[Any]:
+    """Return one hourly_analysis event per period_start, preferring fresh schema."""
+    deduped: Dict[str, Any] = {}
+    for event in events:
+        data = getattr(event, "data", {}) or {}
+        if data.get("type") != "hourly_analysis":
+            continue
+        timestamp = getattr(event, "timestamp", None)
+        key = data.get("period_start") or (timestamp.isoformat() if timestamp else "")
+        if not key:
+            continue
+        current = deduped.get(key)
+        if current is None or (
+            (_event_schema_version(event), _event_duration_seconds(event))
+            > (_event_schema_version(current), _event_duration_seconds(current))
+        ):
+            deduped[key] = event
+    return list(deduped.values())
+
+
 def _known_config_key(parts: list[str]) -> bool:
     if not parts or any(not part for part in parts):
         return False
@@ -139,14 +177,19 @@ def _try_read_from_bucket(target_date: date_type, config: Config):
         if not events:
             return None
 
-        # Aggregate hourly events into a daily summary
-        hourly_events = [e for e in events if e.data.get("type") == "hourly_analysis"]
+        # Aggregate hourly events into a daily summary.  Older daemon versions
+        # could write multiple partial hourly_analysis rows for the same hour
+        # during shutdown; keep the longest event per period_start.
+        hourly_events = _dedupe_hourly_analysis_events(events)
         if not hourly_events:
             return None
 
         total_effective = sum(e.data.get("effective_hours", 0) for e in hourly_events)
         total_deep = sum(e.data.get("deep_work_hours", 0) for e in hourly_events)
         total_switches = sum(e.data.get("switch_count", 0) for e in hourly_events)
+        total_task_switches = sum(
+            e.data.get("task_switch_count", 0) for e in hourly_events
+        )
         focus_scores = [e.data.get("focus_score", 0) for e in hourly_events]
         avg_focus = int(sum(focus_scores) / len(focus_scores)) if focus_scores else 0
         productivity_scores = [e.data.get("productivity_score", 0) for e in hourly_events]
@@ -159,9 +202,15 @@ def _try_read_from_bucket(target_date: date_type, config: Config):
         # Merge activity breakdowns
         from collections import defaultdict
         breakdown: dict = defaultdict(float)
+        task_breakdown: dict = defaultdict(float)
+        task_deep_breakdown: dict = defaultdict(float)
         for e in hourly_events:
             for k, v in e.data.get("activity_breakdown", {}).items():
                 breakdown[k] += v
+            for k, v in e.data.get("task_breakdown", {}).items():
+                task_breakdown[k] += v
+            for k, v in e.data.get("task_deep_work_breakdown", {}).items():
+                task_deep_breakdown[k] += v
 
         total_hours = sum(breakdown.values())
 
@@ -187,6 +236,9 @@ def _try_read_from_bucket(target_date: date_type, config: Config):
             hourly_scores=sorted(hourly_scores),
             productivity_score=avg_productivity,
             death_loops=death_loops,
+            task_switch_count=total_task_switches,
+            task_breakdown=dict(task_breakdown),
+            task_deep_work_breakdown=dict(task_deep_breakdown),
         )
     except Exception:
         logger.debug(
@@ -209,23 +261,19 @@ def _classify_slices(config: Config, slices):
     return create_classifier(config, on_hybrid_fallback=warn_fallback).batch_classify(slices)
 
 
-def _get_analysis(target_date: date_type, config: Config):
-    """Get analysis result: try bucket first, fallback to live computation."""
+def _compute_live_analysis(target_date: date_type, config: Config, *, rule_only: bool):
+    """Compute exact day-level analysis from raw ActivityWatch slices."""
     from aw_coach.analyzer import PatternAnalyzer
     from aw_coach.collector import DataCollector
 
-    # 1. Try pre-computed results from ai-coach bucket
-    result = _try_read_from_bucket(target_date, config)
-    if result is not None:
-        return result
-
-    # 2. Fallback: compute from raw data
     try:
         collector = DataCollector()
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        click.echo("Is ActivityWatch running? Try `aw-coach doctor`.", err=True)
-        sys.exit(1)
+        if not rule_only:
+            click.echo(f"Error: {e}", err=True)
+            click.echo("Is ActivityWatch running? Try `aw-coach doctor`.", err=True)
+            sys.exit(1)
+        return None
 
     start = datetime.combine(target_date, datetime.min.time())
     end = datetime.combine(target_date, datetime.max.time())
@@ -236,9 +284,40 @@ def _get_analysis(target_date: date_type, config: Config):
     if not slices:
         return None
 
-    rules = _classify_slices(config, slices)
+    if rule_only:
+        from aw_coach.rules.engine import RuleEngine
+
+        engine = RuleEngine.with_all_rules()
+        rules = [
+            engine.classify(s.primary_app, s.primary_title, s.web_url)
+            for s in slices
+        ]
+    else:
+        rules = _classify_slices(config, slices)
+
+    if config.tasks.enabled:
+        from aw_coach.task_signals import annotate_task_slices
+
+        annotate_task_slices(slices, rules, config.tasks)
+
     analyzer = PatternAnalyzer(config.analysis)
     return analyzer.analyze(slices, rules)
+
+
+def _get_analysis(target_date: date_type, config: Config):
+    """Get analysis result, preferring exact day-level raw computation."""
+
+    # 1. Try pre-computed results from ai-coach bucket
+    result = _try_read_from_bucket(target_date, config)
+    if result is not None:
+        # Hourly bucket aggregation is fast but can undercount deep blocks that
+        # cross an hour boundary.  Recompute from raw slices with rule-only
+        # classification, and keep the bucket as an offline fallback.
+        live_result = _compute_live_analysis(target_date, config, rule_only=True)
+        return live_result or result
+
+    # 2. Fallback: compute from raw data using the configured classifier.
+    return _compute_live_analysis(target_date, config, rule_only=False)
 
 
 @click.group(invoke_without_command=True)
@@ -389,6 +468,10 @@ def _first_run_historical(config: Config):
         return None
 
     rules = _classify_slices(config, slices)
+    if config.tasks.enabled:
+        from aw_coach.task_signals import annotate_task_slices
+
+        annotate_task_slices(slices, rules, config.tasks)
     analyzer = PatternAnalyzer(config.analysis)
     return analyzer.analyze(slices, rules)
 
@@ -684,19 +767,21 @@ def report(full: bool, dry_run: bool, date: str) -> None:
     use_ai = full and not dry_run and config.ai.backend != "rule_only"
 
     # Task/project breakdown
-    project_breakdown = None
+    project_breakdown = analysis.task_breakdown or None
     inbox_items = None
     try:
         from aw_coach.storage import Storage
 
         storage = Storage(config.db_path)
         inbox_items = storage.get_inbox_items(dismissed=False, limit=10)
-        task_rows = storage.get_task_daily_summary(target.isoformat())
-        if task_rows:
-            project_breakdown = {
-                row["label"]: row["total_sec"] / 3600 for row in task_rows
-            }
-        else:
+        if project_breakdown is None:
+            task_rows = storage.get_task_daily_summary(target.isoformat())
+            if task_rows:
+                project_breakdown = {
+                    row["label"]: row["total_sec"] / 3600 for row in task_rows
+                }
+
+        if project_breakdown is None:
             from collections import defaultdict
 
             from aw_coach.collector import DataCollector
@@ -1623,6 +1708,10 @@ def reclassify(from_date: str, to_date: Optional[str]) -> None:
 
         if slices:
             rules = [engine.classify(s.primary_app, s.primary_title, s.web_url) for s in slices]
+            if config.tasks.enabled:
+                from aw_coach.task_signals import annotate_task_slices
+
+                annotate_task_slices(slices, rules, config.tasks)
             analysis = analyzer.analyze(slices, rules)
 
             # Save updated report

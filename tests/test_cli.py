@@ -9,7 +9,8 @@ from unittest.mock import patch
 import yaml
 from click.testing import CliRunner
 
-from aw_coach.cli import main
+from aw_coach.analyzer import AnalysisResult
+from aw_coach.cli import _dedupe_hourly_analysis_events, main
 from aw_coach.collector import ActivitySlice, DataCollector
 from aw_coach.config import Config, CostConfig, ReportConfig, load_config
 from aw_coach.storage import Storage
@@ -31,6 +32,57 @@ def test_no_subcommand_shows_help():
     assert "report" in result.output
     assert "doctor" in result.output
     assert "rule-test" in result.output
+
+
+def test_dedupe_hourly_analysis_events_prefers_full_hour():
+    ts = datetime(2026, 6, 23, 12, 0)
+    partial = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(minutes=31),
+        data={"type": "hourly_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+    full = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={"type": "hourly_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+    other = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={"type": "partial_hour_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+
+    result = _dedupe_hourly_analysis_events([partial, other, full])
+
+    assert result == [full]
+
+
+def test_dedupe_hourly_analysis_events_prefers_newer_schema():
+    ts = datetime(2026, 6, 23, 12, 0)
+    old_schema = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={
+            "type": "hourly_analysis",
+            "period_start": "2026-06-23T12:00:00",
+            "schema_version": 2,
+            "deep_work_hours": 0.1,
+        },
+    )
+    new_schema = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={
+            "type": "hourly_analysis",
+            "period_start": "2026-06-23T12:00:00",
+            "schema_version": 3,
+            "deep_work_hours": 0.4,
+        },
+    )
+
+    result = _dedupe_hourly_analysis_events([old_schema, new_schema])
+
+    assert result == [new_schema]
 
 
 def test_rule_test_command():
@@ -75,6 +127,35 @@ def test_quiet_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["-q", "cost"])
     assert result.exit_code == 0
+
+
+def test_report_prefers_live_task_breakdown_over_stale_storage(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_daily_summary("2026-06-23", "old", "stale-task", 7200)
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+        task_breakdown={"fresh-task": 1.0},
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["report", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "fresh-task" in result.output
+    assert "stale-task" not in result.output
 
 
 def test_health_command_reads_local_state(tmp_path):
