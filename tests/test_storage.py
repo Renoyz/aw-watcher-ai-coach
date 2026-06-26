@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from aw_coach.daily_insights import DailyInsight
 from aw_coach.storage import Storage
 from aw_coach.task_models import TaskEvidence, TaskSession
 
@@ -239,3 +240,47 @@ class TestTaskSessionLedger:
         assert row["session_uid"]
         assert row["evidence"] == []
         assert row["source"] == {}
+
+
+class TestDailyInsightsStorage:
+    def test_save_and_read_daily_insights(self, storage):
+        insight = DailyInsight(
+            date="2026-06-23",
+            kind="fragmented_main_task",
+            title="主任务被切成多段",
+            body="body",
+            evidence=[{"segments": 4}],
+            suggestion="suggestion",
+            severity=0.8,
+            confidence=0.7,
+        )
+
+        storage.save_daily_insights("2026-06-23", [insight])
+        storage.save_daily_insights("2026-06-23", [insight])
+
+        rows = storage.get_daily_insights("2026-06-23")
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "fragmented_main_task"
+        assert rows[0]["evidence"] == [{"segments": 4}]
+
+    def test_daily_insight_corrupt_evidence_falls_back_to_empty(self, storage):
+        storage._conn.execute(
+            "INSERT INTO daily_insights "
+            "(date, kind, title, body, evidence_json) VALUES (?, ?, ?, ?, ?)",
+            ("2026-06-23", "x", "bad", "body", "{bad-json"),
+        )
+        storage._conn.commit()
+
+        rows = storage.get_daily_insights("2026-06-23")
+
+        assert rows[0]["evidence"] == []
+
+    def test_delete_daily_insights(self, storage):
+        storage.save_daily_insights(
+            "2026-06-23",
+            [DailyInsight("2026-06-23", "x", "title", "body")],
+        )
+
+        storage.delete_daily_insights("2026-06-23")
+
+        assert storage.get_daily_insights("2026-06-23") == []

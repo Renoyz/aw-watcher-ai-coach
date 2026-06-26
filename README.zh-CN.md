@@ -48,6 +48,7 @@ aw-coach status          # 今日概览
 aw-coach state           # 实时语义状态（需 daemon）
 aw-coach report          # 日报
 aw-coach report --full   # 含 AI 建议
+aw-coach insights today  # 日终额外观察
 aw-coach inbox list      # 查看主动辅助消息
 aw-coach task list       # 今日任务分布
 aw-coach task timeline today
@@ -152,6 +153,7 @@ enabled = false    # 默认关闭，保护隐私
 | 命令 | 说明 |
 | --- | --- |
 | `aw-coach inbox list/dismiss/accept` | 主动辅助收件箱 |
+| `aw-coach insights DATE [--rebuild --json]` | 日终后台额外观察 |
 | `aw-coach task list/timeline/explain/rebuild/confirm/set/review` | 任务时间轴、回放与校准 |
 | `aw-coach debug-day DATE` | 原始切片、规则和任务会话的回放诊断 |
 | `aw-coach serve` | 交互式 Web 仪表盘 |

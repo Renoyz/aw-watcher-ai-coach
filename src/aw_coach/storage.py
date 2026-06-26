@@ -164,6 +164,27 @@ class Storage:
             self._migrate_task_session_ledger()
             self._conn.execute("PRAGMA user_version = 8")
 
+        if version < 9:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS daily_insights (
+                    id INTEGER PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    suggestion TEXT NOT NULL DEFAULT '',
+                    severity REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    source_version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(date, kind, title)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_insights_date
+                    ON daily_insights(date);
+                PRAGMA user_version = 9;
+            """)
+
         self._conn.commit()
 
     def _table_columns(self, table: str) -> set[str]:
@@ -463,6 +484,64 @@ class Storage:
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    # === Daily insights ===
+
+    def save_daily_insights(self, day: str, insights: List[object]) -> None:
+        self._conn.executemany(
+            "INSERT INTO daily_insights "
+            "(date, kind, title, body, evidence_json, suggestion, severity, "
+            "confidence, source_version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(date, kind, title) DO UPDATE SET "
+            "body=excluded.body, evidence_json=excluded.evidence_json, "
+            "suggestion=excluded.suggestion, severity=excluded.severity, "
+            "confidence=excluded.confidence, source_version=excluded.source_version, "
+            "created_at=datetime('now')",
+            [
+                (
+                    day,
+                    self._insight_value(insight, "kind"),
+                    self._insight_value(insight, "title"),
+                    self._insight_value(insight, "body"),
+                    json.dumps(
+                        self._insight_value(insight, "evidence", []),
+                        ensure_ascii=False,
+                    ),
+                    self._insight_value(insight, "suggestion", ""),
+                    self._insight_value(insight, "severity", 0.0),
+                    self._insight_value(insight, "confidence", 0.0),
+                    self._insight_value(insight, "source_version", 1),
+                )
+                for insight in insights
+            ],
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _insight_value(insight: object, key: str, default=None):
+        if isinstance(insight, dict):
+            return insight.get(key, default)
+        return getattr(insight, key, default)
+
+    def get_daily_insights(self, day: str) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT date, kind, title, body, evidence_json, suggestion, severity, "
+            "confidence, source_version, created_at "
+            "FROM daily_insights WHERE date = ? "
+            "ORDER BY severity DESC, confidence DESC, id ASC",
+            (day,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = self._safe_json_list(item.get("evidence_json"))
+            result.append(item)
+        return result
+
+    def delete_daily_insights(self, day: str) -> None:
+        self._conn.execute("DELETE FROM daily_insights WHERE date = ?", (day,))
+        self._conn.commit()
 
     # === Task sessions ===
 

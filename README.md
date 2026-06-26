@@ -50,6 +50,7 @@ aw-coach status
 aw-coach state
 aw-coach report
 aw-coach report --full
+aw-coach insights today
 aw-coach inbox list
 aw-coach task list
 aw-coach task timeline today
@@ -158,6 +159,7 @@ classification instead of making external calls.
 | Command | Purpose |
 | --- | --- |
 | `aw-coach inbox list/dismiss/accept` | Proactive assistance inbox |
+| `aw-coach insights DATE [--rebuild --json]` | End-of-day background observations |
 | `aw-coach task list/timeline/explain/rebuild/confirm/set/review` | Task timeline, replay, and calibration |
 | `aw-coach debug-day DATE` | Replay diagnostics for raw slices, rules, and task sessions |
 | `aw-coach serve` | Interactive web dashboard |

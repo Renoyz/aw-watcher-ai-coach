@@ -65,6 +65,28 @@ class TestDailyReport:
         assert report.startswith("#")
         assert "##" in report
 
+    def test_daily_insights_section_is_optional(self, generator, sample_analysis):
+        report = generator.generate_daily(
+            date(2026, 5, 30),
+            sample_analysis,
+            daily_insights=[
+                {
+                    "date": "2026-05-30",
+                    "kind": "fragmented_main_task",
+                    "title": "主任务被切成多段",
+                    "body": "api 今天被拆成多段。",
+                    "evidence": [{"task": "api", "segments": 4, "longest_minutes": 20}],
+                    "suggestion": "先看最近任务时间轴恢复上下文。",
+                    "severity": 0.8,
+                    "confidence": 0.7,
+                }
+            ],
+        )
+
+        assert "## 额外观察" in report
+        assert "主任务被切成多段" in report
+        assert "可以尝试" in report
+
 
 class TestStatusOutput:
     def test_contains_current_stats(self, generator, sample_analysis):

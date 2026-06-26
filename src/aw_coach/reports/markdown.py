@@ -7,6 +7,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from aw_coach.analyzer import AnalysisResult
+from aw_coach.daily_insights import render_daily_insights
 from aw_coach.reports.suggestions import generate_rule_suggestions
 
 
@@ -52,6 +53,7 @@ class ReportGenerator:
         use_ai: bool = False,
         project_breakdown: Optional[Dict[str, float]] = None,
         inbox_items: Optional[List[dict]] = None,
+        daily_insights: Optional[List[dict]] = None,
     ) -> str:
         sections = [
             self._header(report_date),
@@ -66,6 +68,9 @@ class ReportGenerator:
             self._energy_curve(analysis),
             self._suggestions_section(analysis, use_ai=use_ai),
         ])
+        insights_section = render_daily_insights(daily_insights or [])
+        if insights_section:
+            sections.append(insights_section)
         inbox_section = self._inbox_section(inbox_items)
         if inbox_section:
             sections.append(inbox_section)

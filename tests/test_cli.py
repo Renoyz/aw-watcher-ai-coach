@@ -230,6 +230,77 @@ def test_task_timeline_and_explain_commands(tmp_path):
     assert "source: app=Code" in explain.output
 
 
+def test_insights_command_outputs_daily_observations(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    start = datetime(2026, 6, 23, 9, 0)
+    for idx in range(4):
+        storage.upsert_task_session(
+            TaskSession(
+                task_id="aw-coach:main",
+                label="main.py",
+                project="aw-coach",
+                intent="implement",
+                started_at=start + timedelta(minutes=idx * 20),
+                ended_at=start + timedelta(minutes=idx * 20 + 15),
+                accumulated_sec=900,
+                outcome="progressed",
+            )
+        )
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["insights", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "## 额外观察" in result.output
+    assert "主任务被切成多段" in result.output
+
+
+def test_insights_command_json_output(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.save_daily_insights(
+        "2026-06-23",
+        [{
+            "kind": "productive_closure",
+            "title": "形成闭环",
+            "body": "body",
+            "evidence": [],
+            "suggestion": "",
+            "severity": 0.5,
+            "confidence": 0.7,
+            "source_version": 1,
+        }],
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=None):
+        runner = CliRunner()
+        result = runner.invoke(main, ["insights", "--json", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert '"kind": "productive_closure"' in result.output
+
+
 def test_task_rebuild_dry_run_does_not_write(tmp_path):
     cfg = SimpleNamespace(
         db_path=tmp_path / "coach.db",

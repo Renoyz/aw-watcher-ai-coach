@@ -331,6 +331,27 @@ def _task_breakdown_from_sessions(storage, target: date_type) -> Optional[Dict[s
     }
 
 
+def _get_or_generate_daily_insights(
+    storage,
+    target: date_type,
+    analysis=None,
+    *,
+    rebuild: bool = False,
+):
+    from aw_coach.daily_insights import generate_daily_insights
+
+    day = target.isoformat()
+    if rebuild:
+        storage.delete_daily_insights(day)
+    rows = [] if rebuild else storage.get_daily_insights(day)
+    if rows:
+        return rows
+    insights = generate_daily_insights(target, storage, analysis)
+    if insights:
+        storage.save_daily_insights(day, insights)
+    return storage.get_daily_insights(day)
+
+
 def _task_time(value: Optional[str]) -> str:
     if not value:
         return "--:--"
@@ -920,6 +941,7 @@ def report(full: bool, dry_run: bool, date: str) -> None:
     # live analysis remains the fallback for days before ledger data exists.
     project_breakdown = None
     inbox_items = None
+    daily_insights = None
     try:
         from aw_coach.storage import Storage
 
@@ -960,6 +982,14 @@ def report(full: bool, dry_run: bool, date: str) -> None:
                 project_breakdown = dict(proj_dur)
     except Exception:
         logger.debug("Project breakdown failed", exc_info=True)
+    try:
+        if "storage" not in locals():
+            from aw_coach.storage import Storage
+
+            storage = Storage(config.db_path)
+        daily_insights = _get_or_generate_daily_insights(storage, target, analysis)
+    except Exception:
+        logger.debug("Daily insights failed", exc_info=True)
 
     reporter = ReportGenerator(config)
     report_text = reporter.generate_daily(
@@ -968,6 +998,7 @@ def report(full: bool, dry_run: bool, date: str) -> None:
         use_ai=use_ai,
         project_breakdown=project_breakdown,
         inbox_items=inbox_items,
+        daily_insights=daily_insights,
     )
 
     if dry_run and config.ai.backend != "rule_only":
@@ -1008,6 +1039,39 @@ def _build_report_prompt(analysis) -> str:
 2. 优先指出可立即改进的点
 3. 若表现优秀，给予正面鼓励
 4. 返回 JSON 数组，每条包含：type, message, priority(1-3)"""
+
+
+@main.command("insights")
+@click.option("--rebuild", is_flag=True, help="Regenerate insights for the day")
+@click.option("--json", "as_json", is_flag=True, help="Print structured JSON")
+@click.argument("date", default="today")
+def insights_command(rebuild: bool, as_json: bool, date: str) -> None:
+    """Show daily background insights."""
+    from aw_coach.daily_insights import insights_to_jsonable, render_daily_insights
+    from aw_coach.storage import Storage
+
+    config = load_config()
+    target = _parse_date(date)
+    storage = Storage(config.db_path)
+    try:
+        analysis = _get_analysis(target, config)
+    except SystemExit:
+        analysis = None
+
+    insights = _get_or_generate_daily_insights(
+        storage,
+        target,
+        analysis,
+        rebuild=rebuild,
+    )
+    if as_json:
+        click.echo(json.dumps(insights_to_jsonable(insights), ensure_ascii=False, indent=2))
+        return
+    rendered = render_daily_insights(insights)
+    if not rendered:
+        click.echo(f"{target.isoformat()} 暂无额外观察。")
+        return
+    click.echo(rendered)
 
 
 @main.command()

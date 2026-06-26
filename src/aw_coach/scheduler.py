@@ -1606,17 +1606,23 @@ class CoachScheduler:
         self._persist_task_sessions_for_day(report_date)
         task_breakdown = None
         if self.config.tasks.enabled:
-            task_breakdown = analysis.task_breakdown or {
+            task_rows = self.storage.get_task_session_summary(report_date.isoformat())
+            task_breakdown = {
+                row["label"]: row["total_sec"] / 3600
+                for row in task_rows
+            } or analysis.task_breakdown or {
                 row["label"]: row["total_sec"] / 3600
                 for row in self.storage.get_task_daily_summary(report_date.isoformat())
             }
         inbox_items = self.storage.get_inbox_items(dismissed=False, limit=10)
+        daily_insights = self._get_or_generate_daily_insights(report_date, analysis)
         report_text = self.reporter.generate_daily(
             report_date,
             analysis,
             use_ai=use_ai,
             project_breakdown=task_breakdown,
             inbox_items=inbox_items,
+            daily_insights=daily_insights,
         )
 
         ai_summary = None
@@ -1677,6 +1683,22 @@ class CoachScheduler:
             delivery=self.config.report.delivery.daily_report,
         )
         return True
+
+    def _get_or_generate_daily_insights(self, report_date: date, analysis) -> List[Dict]:
+        try:
+            from aw_coach.daily_insights import generate_daily_insights
+
+            day = report_date.isoformat()
+            rows = self.storage.get_daily_insights(day)
+            if rows:
+                return rows
+            insights = generate_daily_insights(report_date, self.storage, analysis)
+            if insights:
+                self.storage.save_daily_insights(day, insights)
+            return self.storage.get_daily_insights(day)
+        except Exception:
+            logger.debug("Daily insight generation failed", exc_info=True)
+            return []
 
     def _run_due_cron_jobs(self, now: datetime) -> None:
         for job in self._cron_runner.due_jobs(now):
