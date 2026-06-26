@@ -88,6 +88,8 @@ aw-coach service install
 aw-coach service start
 aw-coach service status
 aw-coach service logs --lines 50
+aw-coach service stop
+aw-coach service uninstall
 ```
 
 The Windows installer first tries Task Scheduler. If normal user permissions cannot
@@ -166,7 +168,7 @@ classification instead of making external calls.
 | `aw-coach cost` | LLM cost statistics |
 | `aw-coach health` | Daemon, delivery, and schedule health |
 | `aw-coach config show/set/path` | Configuration management |
-| `aw-coach service status/logs` | Windows service diagnostics |
+| `aw-coach service install/start/stop/status/logs/uninstall` | Windows service management |
 
 ## Privacy Notes
 
