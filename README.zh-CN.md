@@ -85,6 +85,8 @@ aw-coach service install
 aw-coach service start
 aw-coach service status
 aw-coach service logs --lines 50
+aw-coach service stop
+aw-coach service uninstall
 ```
 
 安装器会先尝试 Windows Task Scheduler。如果普通用户权限无法注册计划任务，会回退到当前用户的 Run key。
@@ -160,7 +162,7 @@ enabled = false    # 默认关闭，保护隐私
 | `aw-coach cost` | LLM 成本统计 |
 | `aw-coach health` | daemon、推送与调度健康概览 |
 | `aw-coach config show/set/path` | 配置管理 |
-| `aw-coach service status/logs` | Windows 服务诊断 |
+| `aw-coach service install/start/stop/status/logs/uninstall` | Windows 服务管理 |
 
 ## 隐私说明
 

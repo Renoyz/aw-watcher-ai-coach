@@ -162,6 +162,90 @@ def _write_raw_config(path: Path, data: dict[str, Any]) -> None:
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _service_manager(config: Optional[Config] = None):
+    from aw_coach.service_installer import ServiceManager
+
+    config = config or load_config()
+    return ServiceManager(project_root=_project_root(), data_dir=Path(config.data_dir))
+
+
+def _format_service_state(status) -> str:
+    if not status.installed:
+        return "not-installed"
+    pids = ",".join(str(pid) for pid in status.daemon_pids)
+    return f"{status.state} pids={pids}" if pids else status.state
+
+
+def _service_state_for_health(config: Config) -> str:
+    import platform as plat
+
+    if plat.system() == "Windows":
+        from aw_coach.service_installer import ServiceError
+
+        try:
+            return _format_service_state(_service_manager(config).status())
+        except ServiceError as e:
+            return f"error: {e}"
+
+    if shutil.which("systemctl"):
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-active", "aw-coach.service"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            return proc.stdout.strip() or proc.stderr.strip() or "unknown"
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
+def _service_autostart_health_line(config: Config) -> str:
+    import platform as plat
+
+    if plat.system() != "Windows":
+        return (
+            click.style("ℹ️  autostart", fg="blue")
+            + " Windows Task Scheduler management available on Windows"
+        )
+
+    from aw_coach.service_installer import ServiceError
+
+    try:
+        status = _service_manager(config).status()
+    except ServiceError as e:
+        return click.style("⚠️  autostart", fg="yellow") + f" {e}"
+
+    if status.installed:
+        return (
+            click.style("✅ autostart", fg="green")
+            + f" {_format_service_state(status)}"
+        )
+    return click.style("ℹ️  autostart", fg="blue") + " not installed"
+
+
+def _daemon_log_paths(data_dir: Path) -> list[tuple[str, Path]]:
+    return [
+        ("stdout", data_dir / "aw-coach-daemon.log"),
+        ("stderr", data_dir / "aw-coach-daemon.err.log"),
+    ]
+
+
+def _tail_file(path: Path, line_count: int) -> str:
+    if not path.exists():
+        return f"(missing: {path})"
+    if line_count <= 0:
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-line_count:]) if lines else "(empty)"
+
+
 def _try_read_from_bucket(target_date: date_type, config: Config):
     """P0-2: Try to read pre-analyzed results from ai-coach bucket."""
     from aw_coach.analyzer import AnalysisResult
@@ -526,6 +610,7 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         click.echo("  cost         View AI API cost usage")
         click.echo("  notify-test  Send a test notification")
         click.echo("  serve       Start interactive local dashboard")
+        click.echo("  service     Manage Windows autostart service")
         click.echo()
         click.echo("Run `aw-coach --help` for all commands.")
 
@@ -1175,6 +1260,8 @@ def doctor(run_calibrate: bool) -> None:
     else:
         click.echo(click.style("✅ platform", fg="green") + f"    {system}")
 
+    click.echo(_service_autostart_health_line(config))
+
     # 5. AI backend + cost
     click.echo(click.style("ℹ️  ai backend", fg="blue") + f"  {config.ai.backend}")
     click.echo(
@@ -1392,20 +1479,7 @@ def health() -> None:
     config = load_config()
     storage = Storage(config.db_path)
 
-    service_state = "unknown"
-    if shutil.which("systemctl"):
-        try:
-            proc = subprocess.run(
-                ["systemctl", "--user", "is-active", "aw-coach.service"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            service_state = proc.stdout.strip() or proc.stderr.strip() or "unknown"
-        except Exception:
-            service_state = "unknown"
-
+    service_state = _service_state_for_health(config)
     last_hourly = storage.get_scheduler_state("last_hourly", "unknown")
     last_summary = storage.get_scheduler_state("last_summary", "unknown")
     next_summary = "unknown"
@@ -1467,6 +1541,97 @@ def _format_health_time(value: Optional[str]) -> str:
         return format_local_timestamp(value)
     except Exception:
         return value
+
+
+@main.group()
+def service() -> None:
+    """Manage Windows autostart service."""
+
+
+@service.command("install")
+def service_install() -> None:
+    """Install aw-coach as a Windows autostart service."""
+    from aw_coach.service_installer import ServiceError
+
+    config = load_config()
+    manager = _service_manager(config)
+    try:
+        manager.install()
+    except ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo("Installed aw-coach autostart service.")
+
+
+@service.command("uninstall")
+def service_uninstall() -> None:
+    """Remove aw-coach Windows autostart service."""
+    from aw_coach.service_installer import ServiceError
+
+    config = load_config()
+    manager = _service_manager(config)
+    try:
+        manager.uninstall()
+    except ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo("Uninstalled aw-coach autostart service.")
+
+
+@service.command("start")
+def service_start() -> None:
+    """Start the aw-coach Windows autostart service."""
+    from aw_coach.service_installer import ServiceError
+
+    config = load_config()
+    manager = _service_manager(config)
+    try:
+        manager.start()
+    except ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo("Started aw-coach service.")
+
+
+@service.command("stop")
+def service_stop() -> None:
+    """Stop the aw-coach Windows autostart service."""
+    from aw_coach.service_installer import ServiceError
+
+    config = load_config()
+    manager = _service_manager(config)
+    try:
+        manager.stop()
+    except ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo("Stopped aw-coach service.")
+
+
+@service.command("status")
+def service_status() -> None:
+    """Show aw-coach Windows autostart service status."""
+    from aw_coach.service_installer import ServiceError
+
+    config = load_config()
+    manager = _service_manager(config)
+    try:
+        status = manager.status()
+    except ServiceError as e:
+        raise click.ClickException(str(e)) from e
+
+    click.echo(f"installed: {'yes' if status.installed else 'no'}")
+    click.echo(f"state:     {status.state}")
+    pids = ", ".join(str(pid) for pid in status.daemon_pids)
+    click.echo(f"pids:      {pids or 'none'}")
+    for label, path in _daemon_log_paths(Path(config.data_dir)):
+        click.echo(f"{label}_log: {path}")
+
+
+@service.command("logs")
+@click.option("--lines", default=80, show_default=True, help="Number of lines per log file")
+def service_logs(lines: int) -> None:
+    """Tail aw-coach daemon logs."""
+    config = load_config()
+    for label, path in _daemon_log_paths(Path(config.data_dir)):
+        click.echo(f"== {label}: {path} ==")
+        click.echo(_tail_file(path, lines))
 
 
 @main.command()
