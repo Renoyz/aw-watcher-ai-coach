@@ -45,12 +45,18 @@ python -m pip install -e ".[dev,ai,screenshot,web]"
 
 ```bash
 aw-coach doctor
+aw-coach health
 aw-coach status
 aw-coach state
 aw-coach report
 aw-coach report --full
+aw-coach insights today
 aw-coach inbox list
 aw-coach task list
+aw-coach task timeline today
+aw-coach task explain today
+aw-coach task rebuild yesterday
+aw-coach debug-day yesterday
 aw-coach serve
 ```
 
@@ -66,6 +72,13 @@ Run the daemon directly:
 
 ```bash
 aw-coach-daemon
+```
+
+When running from a development checkout, point the service or wrapper at the
+project virtualenv:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m aw_coach.daemon
 ```
 
 On Windows, install and inspect autostart:
@@ -108,10 +121,30 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false
 morning_brief_time = "09:00"
+notification_budget_exempt_kinds = ["summary", "daily_report", "morning_brief"]
+hourly_backfill_hours = 168
+llm_timeout_seconds = 90
+
+[report.delivery]
+instant_summary = "notify"   # notify | inbox | both | off
+daily_report = "notify"
+morning_brief = "inbox"
+medium_signal = "inbox"
+high_severity_signal = "notify"
+task_confirm = "inbox"
+task_confirm_min_minutes = 10
+task_confirm_daily_limit = 3
 
 [tasks]
 enabled = true
 project_roots = ["~/projects", "~/下载/activitywatch"]
+
+[context_capture]
+enabled = true
+interval_seconds = 60
+command_args_mode = "summary"  # off | summary | full
+capture_cwd = true
+capture_git = true
 
 [screenshot]
 enabled = false
@@ -126,9 +159,12 @@ classification instead of making external calls.
 | Command | Purpose |
 | --- | --- |
 | `aw-coach inbox list/dismiss/accept` | Proactive assistance inbox |
-| `aw-coach task list/confirm/set/review` | Task perception and calibration |
+| `aw-coach insights DATE [--rebuild --json]` | End-of-day background observations |
+| `aw-coach task list/timeline/explain/rebuild/confirm/set/review` | Task timeline, replay, and calibration |
+| `aw-coach debug-day DATE` | Replay diagnostics for raw slices, rules, and task sessions |
 | `aw-coach serve` | Interactive web dashboard |
 | `aw-coach cost` | LLM cost statistics |
+| `aw-coach health` | Daemon, delivery, and schedule health |
 | `aw-coach config show/set/path` | Configuration management |
 | `aw-coach service status/logs` | Windows service diagnostics |
 
@@ -138,6 +174,8 @@ This tool is local-first, but it can still process sensitive local activity meta
 
 - ActivityWatch event data stays in your local ActivityWatch database.
 - AI calls are controlled by the configured backend.
+- Context capture stores local cwd, Git repo/branch, and a command summary only;
+  it does not read file contents.
 - Screenshot analysis is optional and disabled by default.
 - Built-in rules can mark sensitive contexts as `skip_screenshot`.
 - Do not commit local databases, reports, screenshots, logs, or secrets.

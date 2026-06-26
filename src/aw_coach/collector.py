@@ -41,11 +41,17 @@ class ActivitySlice:
     git_repo: Optional[str] = None
     git_branch: Optional[str] = None
     terminal_command: Optional[str] = None
+    terminal_action: Optional[str] = None
     screen_context: Optional[str] = None
+    semantic_project: Optional[str] = None
+    task_id: Optional[str] = None
+    task_label: Optional[str] = None
+    task_confidence: float = 0.0
 
 
 BROWSER_APPS = frozenset([
-    "chrome", "chromium", "firefox", "firefox_firefox", "safari", "edge",
+    "chrome", "google-chrome", "google-chrome-stable", "chromium",
+    "firefox", "firefox_firefox", "safari", "edge",
     "arc", "brave", "vivaldi", "opera", "librewolf", "firefox-esr",
 ])
 
@@ -54,6 +60,7 @@ def merge_events(
     windows: List[Dict[str, Any]],
     afk: List[Dict[str, Any]],
     web_events: Optional[List[Dict[str, Any]]] = None,
+    context_events: Optional[List[Dict[str, Any]]] = None,
 ) -> List[ActivitySlice]:
     if not windows:
         return []
@@ -154,6 +161,8 @@ def merge_events(
     # Enrich browser slices with web bucket URLs
     if web_events:
         _enrich_with_web_urls(slices, web_events)
+    if context_events:
+        _enrich_with_context_events(slices, context_events)
 
     # Phase 3: enrich with domain, path, site_type
     # Note: process/git enrichment is NOT done here because it reads live
@@ -202,6 +211,48 @@ def _enrich_with_web_urls(
             s.web_url = best_url
 
 
+def _enrich_with_context_events(
+    slices: List[ActivitySlice], context_events: List[Dict[str, Any]]
+) -> None:
+    """Attach lightweight process/git context by greatest time overlap."""
+    parsed = []
+    for event in context_events:
+        data = event.get("data", {}) or {}
+        if data.get("type") != "context_snapshot":
+            continue
+        ts = event["timestamp"]
+        dur = event["duration"]
+        dur_sec = dur.total_seconds() if hasattr(dur, "total_seconds") else float(dur)
+        parsed.append({
+            "start": ts,
+            "end": ts + timedelta(seconds=dur_sec),
+            "data": data,
+        })
+
+    for s in slices:
+        best = None
+        best_overlap = 0.0
+        for ctx in parsed:
+            overlap_start = max(s.start, ctx["start"])
+            overlap_end = min(s.end, ctx["end"])
+            overlap = (overlap_end - overlap_start).total_seconds()
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = ctx["data"]
+        if not best:
+            continue
+
+        s.process_name = best.get("process_name")
+        s.process_cwd = best.get("process_cwd")
+        s.git_repo = best.get("git_repo")
+        s.git_branch = best.get("git_branch")
+        s.terminal_command = (
+            best.get("terminal_command_summary")
+            or best.get("terminal_command")
+        )
+        s.terminal_action = best.get("terminal_action")
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: slice enrichment helpers
 # ---------------------------------------------------------------------------
@@ -245,23 +296,13 @@ def _enrich_slice_from_url(s: ActivitySlice) -> None:
 
 
 def _enrich_slice_from_git(s: ActivitySlice) -> None:
-    """Extract git repo/branch from process cwd.
+    """Do not infer historical git context from the current filesystem.
 
-    NOTE: This is currently a no-op because process_cwd is never populated
-    for historical slices (it would require live system state).  If AW window
-    events include pid in the future, this can be wired for the *latest* slice
-    only, inside the scheduler tick.
+    Context snapshots already carry the repo/branch observed at capture time.
+    Re-reading ``process_cwd`` later would make old reports depend on whatever
+    branch that directory is on today.
     """
-    cwd = s.process_cwd
-    if cwd:
-        try:
-            from aw_coach.git_context import get_git_context_from_path
-            git_ctx = get_git_context_from_path(cwd)
-            if git_ctx:
-                s.git_repo = git_ctx.repo_name
-                s.git_branch = git_ctx.branch
-        except Exception:
-            pass
+    return
 
 
 class DataCollector:
@@ -301,6 +342,7 @@ class DataCollector:
 
         # Try to fetch web bucket data (may not exist)
         web_events_raw = self._fetch_web_events(utc_start, utc_end)
+        context_events_raw = self._fetch_context_events(utc_start, utc_end)
 
         win_dicts = [
             {
@@ -326,8 +368,21 @@ class DataCollector:
             }
             for e in web_events_raw
         ]
+        context_dicts = [
+            {
+                "timestamp": e.timestamp,
+                "duration": e.duration,
+                "data": e.data,
+            }
+            for e in context_events_raw
+        ]
 
-        slices = merge_events(win_dicts, afk_dicts, web_events=web_dicts)
+        slices = merge_events(
+            win_dicts,
+            afk_dicts,
+            web_events=web_dicts,
+            context_events=context_dicts,
+        )
         # Convert all timestamps to local time for downstream analysis
         for s in slices:
             s.start = _utc_to_local(s.start)
@@ -346,6 +401,20 @@ class DataCollector:
             return []
         try:
             return self.client.get_events(web_bucket, start=start, end=end)
+        except Exception:
+            return []
+
+    def _fetch_context_events(self, start, end) -> list:
+        """Fetch aw-coach context events. Returns empty list if bucket doesn't exist."""
+        bucket = f"aw-coach-context_{self.hostname}"
+        try:
+            buckets = self.client.get_buckets()
+        except Exception:
+            return []
+        if bucket not in buckets:
+            return []
+        try:
+            return self.client.get_events(bucket, start=start, end=end)
         except Exception:
             return []
 

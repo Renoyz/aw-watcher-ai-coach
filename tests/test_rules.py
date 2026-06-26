@@ -96,6 +96,11 @@ class TestBrowserSubRules:
         assert r.activity_type == "ai_assisted"
         assert r.confidence >= 0.85
 
+    def test_kimi_ai_assisted(self, engine):
+        r = engine.classify("firefox", "Kimi", "https://www.kimi.com/chat")
+        assert r.activity_type == "ai_assisted"
+        assert r.confidence >= 0.85
+
     def test_claude_ai_assisted(self, engine):
         r = engine.classify("firefox", "Claude", "https://claude.ai/chat")
         assert r.activity_type == "ai_assisted"
@@ -105,6 +110,29 @@ class TestBrowserSubRules:
         r = engine.classify("chrome", "tokio - Rust", "https://docs.rs/tokio/latest")
         assert r.activity_type == "research"
         assert r.confidence >= 0.85
+
+    def test_x_dot_com_does_not_match_v2ex(self, engine):
+        r = engine.classify("firefox", "V2EX", "https://v2ex.com/t/1")
+        assert r.activity_type == "research"
+        assert r.confidence < 0.85
+
+    def test_internal_code_platform_programming(self, engine):
+        r = engine.classify(
+            "firefox",
+            "TARS Code",
+            "https://code.tars-ai.com/project",
+        )
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.80
+
+    def test_internal_jenkins_programming(self, engine):
+        r = engine.classify(
+            "firefox",
+            "Jenkins",
+            "https://xrobot-jenkins.tars-ai.com/job/build",
+        )
+        assert r.activity_type == "programming"
+        assert r.confidence >= 0.80
 
 
 class TestChineseApps:
@@ -191,6 +219,10 @@ class TestUnknownApps:
 
     def test_case_insensitive(self, engine):
         r = engine.classify("CODE", "main.py", None)
+        assert r.activity_type == "programming"
+
+    def test_notepad_plus_plus_wine(self, engine):
+        r = engine.classify("notepad-plus-plus.exe", "main.py", None)
         assert r.activity_type == "programming"
 
 

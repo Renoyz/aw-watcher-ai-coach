@@ -7,11 +7,11 @@ import logging
 import signal
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-from aw_coach.analyzer import PatternAnalyzer
+from aw_coach.analyzer import ANALYSIS_SCHEMA_VERSION, PatternAnalyzer
 from aw_coach.background_summary import generate_background_summary
 from aw_coach.classifier import create_classifier
 from aw_coach.collector import DataCollector, _local_to_utc
@@ -23,6 +23,7 @@ from aw_coach.report import ReportGenerator, generate_html_dashboard
 from aw_coach.state import CoachAgentStateMachine
 
 logger = logging.getLogger(__name__)
+TASK_TRACKER_STATE_KEY = "task_tracker"
 
 if TYPE_CHECKING:
     from aw_coach.context_stack import ContextStack
@@ -76,6 +77,11 @@ class CoachScheduler:
         self._task_signal_extractor = None
         self._task_fusion = None
         self._task_tracker = None
+        self._task_confirm_candidates: Dict[str, datetime] = {}
+        self._task_confirm_count_date: Optional[date] = None
+        self._task_confirm_count = 0
+        self._context_bucket_created = False
+        self._last_context_capture: Optional[datetime] = None
 
         # Background LLM summary worker
         self._summary_executor = ThreadPoolExecutor(
@@ -96,8 +102,14 @@ class CoachScheduler:
             self._storage = Storage(self.config.db_path)
         return self._storage
 
-    def _classify_slices(self, slices):
+    def _classify_slices(self, slices, *, allow_llm: bool = True):
         """Classify slices using either RuleEngine or HybridBackend."""
+        if not allow_llm:
+            engine = self._get_rule_engine()
+            return [
+                engine.classify(s.primary_app, s.primary_title, s.web_url)
+                for s in slices
+            ]
         return self.classifier.batch_classify(slices)
 
     # ------------------------------------------------------------------
@@ -151,29 +163,32 @@ class CoachScheduler:
             switches = 0
             if len(recent) >= 2:
                 sorted_recent = sorted(recent, key=lambda s: s.end)
-                types = [
-                    engine.classify(r.primary_app, r.primary_title, r.web_url).activity_type
+                recent_rules = [
+                    engine.classify(r.primary_app, r.primary_title, r.web_url)
                     for r in sorted_recent
                 ]
-                switches = sum(
-                    1 for i in range(len(types) - 1) if types[i] != types[i + 1]
-                )
+                self._annotate_task_slices(sorted_recent, recent_rules)
+                keys = [self._semantic_switch_key(s) for s in sorted_recent]
+                if any(keys):
+                    filtered_keys = [key for key in keys if key]
+                    switches = sum(
+                        1
+                        for i in range(len(filtered_keys) - 1)
+                        if filtered_keys[i] != filtered_keys[i + 1]
+                    )
+                else:
+                    types = [r.activity_type for r in recent_rules]
+                    switches = sum(
+                        1 for i in range(len(types) - 1) if types[i] != types[i + 1]
+                    )
 
-            # --- Live process enrichment (only for the latest slice) ----
-            live_terminal_cmd: Optional[str] = None
-            if latest.primary_app.lower() in {
-                "terminal", "iterm2", "gnome-terminal", "konsole",
-                "alacritty", "wezterm", "warp", "tabby", "xterm",
-                "kitty", "windows terminal", "terminator", "tilix",
-                "hyper", "st",
-            }:
-                try:
-                    from aw_coach.process_context import get_terminal_foreground_command
-                    cmd = get_terminal_foreground_command()
-                    if cmd:
-                        live_terminal_cmd = cmd[0] if len(cmd) == 1 else f"{cmd[0]} {cmd[1]}"
-                except Exception:
-                    pass
+            # --- Live process enrichment + durable context capture --------
+            context_snapshot = self._capture_context_snapshot(now, latest)
+            live_terminal_cmd = (
+                context_snapshot.terminal_command_summary
+                if context_snapshot is not None
+                else None
+            )
             # ---------------------------------------------------------------
 
             # --- Preliminary state (for screenshot trigger decision) ------
@@ -250,6 +265,7 @@ class CoachScheduler:
                 screen_content_type=screenshot_result.content_type if screenshot_result else None,
                 history=history_records,
             )
+            self._apply_context_snapshot_to_state(state, context_snapshot)
 
             # --- Context Stack update -------------------------------------
             if self._context_stack is None:
@@ -274,6 +290,7 @@ class CoachScheduler:
                     ),
                     history=history_records,
                 )
+                self._apply_context_snapshot_to_state(state, context_snapshot)
                 # Sync context stack with corrected block time
                 self._context_stack.update(state, now)
             # ---------------------------------------------------------------
@@ -397,23 +414,58 @@ class CoachScheduler:
             )
         return self._policy_engine
 
+    @staticmethod
+    def _semantic_switch_key(s) -> Optional[str]:
+        task_id = getattr(s, "task_id", None)
+        if task_id and not str(task_id).startswith("unknown:"):
+            return str(task_id)
+        git_repo = getattr(s, "git_repo", None)
+        if git_repo:
+            return f"repo:{git_repo}:{getattr(s, 'git_branch', '') or ''}"
+        project = getattr(s, "semantic_project", None)
+        if project:
+            return f"project:{project}"
+        return None
+
+    @staticmethod
+    def _apply_context_snapshot_to_state(state, snapshot) -> None:
+        if snapshot is None:
+            return
+        if getattr(snapshot, "git_repo", None):
+            state.git_repo = snapshot.git_repo
+            state.git_branch = snapshot.git_branch
+            if not state.semantic_project:
+                state.semantic_project = snapshot.git_repo
+        if getattr(snapshot, "terminal_action", None):
+            state.semantic_action = snapshot.terminal_action
+
     def _apply_task_perception(self, state, rule, now: datetime):
         if not self.config.tasks.enabled:
             return state
-        from aw_coach.git_context import get_git_context_for_project
+        from aw_coach.git_context import GitContext, get_git_context_for_project
         from aw_coach.task_fusion import TaskFusionEngine
         from aw_coach.task_signals import TaskSignalExtractor
-        from aw_coach.task_tracker import TaskSessionTracker
 
         if self._task_signal_extractor is None:
             self._task_signal_extractor = TaskSignalExtractor(self.config.tasks)
         if self._task_fusion is None:
             self._task_fusion = TaskFusionEngine()
         if self._task_tracker is None:
-            self._task_tracker = TaskSessionTracker()
+            self._task_tracker = self._restore_task_tracker()
+        current = self._task_tracker.current_session
+        if current is not None and self._task_fusion.state.confirmed_task_id is None:
+            self._task_fusion.restore_confirmed(
+                task_id=current.task_id,
+                label=current.label,
+                project=current.project,
+                intent=current.intent,
+                confidence=current.confidence,
+            )
 
         git_ctx = None
-        if state.semantic_project:
+        if state.git_repo:
+            git_ctx = GitContext(repo_name=state.git_repo, branch=state.git_branch)
+        elif state.semantic_project:
             try:
                 git_ctx = get_git_context_for_project(
                     state.semantic_project,
@@ -433,13 +485,117 @@ class CoachScheduler:
             project=state.semantic_project,
         )
         task = self._task_fusion.resolve(candidate)
-        self._task_tracker.update(task, state, now)
+        evidence = self._task_session_evidence(candidate, task, rule)
+        source = self._task_session_source(state, rule)
+        self._task_tracker.update(
+            task,
+            state,
+            now,
+            evidence=evidence,
+            source=source,
+        )
+        self._persist_current_task_session()
+        self._persist_task_tracker()
 
         state.task_id = task.task_id
         state.task_label = task.label
         state.task_intent = task.intent
         state.task_confidence = task.confidence
         return state
+
+    def _restore_task_tracker(self):
+        from aw_coach.task_tracker import TaskSessionTracker
+
+        try:
+            active = self.storage.get_active_task_session()
+            if active:
+                session = self.storage.task_session_from_row(active)
+                return TaskSessionTracker.from_active_session(
+                    session,
+                    last_update=self._parse_stored_datetime(
+                        active.get("updated_at")
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to restore active task session", exc_info=True)
+
+        raw = self.storage.get_scheduler_state(TASK_TRACKER_STATE_KEY)
+        if raw:
+            try:
+                return TaskSessionTracker.from_json(raw)
+            except Exception:
+                logger.debug("Failed to restore task tracker, starting fresh", exc_info=True)
+        return TaskSessionTracker()
+
+    @staticmethod
+    def _parse_stored_datetime(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _task_session_evidence(candidate, task, rule):
+        from aw_coach.task_models import TaskEvidence
+
+        evidence = []
+        if task.task_id == candidate.task_id:
+            evidence.extend(candidate.evidence)
+        else:
+            evidence.append(
+                TaskEvidence(
+                    "fusion",
+                    f"retained:{task.task_id}; candidate:{candidate.task_id}",
+                    task.confidence,
+                )
+            )
+        evidence.append(TaskEvidence("rule", rule.activity_type, rule.confidence))
+        return evidence
+
+    @staticmethod
+    def _task_session_source(state, rule) -> Dict:
+        return {
+            "app": state.current_app,
+            "title": state.current_title,
+            "url": state.current_url,
+            "git_repo": state.git_repo,
+            "git_branch": state.git_branch,
+            "semantic_project": state.semantic_project,
+            "semantic_filename": state.semantic_filename,
+            "likely_mode": state.likely_mode,
+            "rule_activity": rule.activity_type,
+            "rule_confidence": rule.confidence,
+        }
+
+    def _persist_task_tracker(self) -> None:
+        tasks_config = getattr(getattr(self, "config", None), "tasks", None)
+        if (
+            tasks_config is None
+            or not getattr(tasks_config, "enabled", False)
+            or self._task_tracker is None
+        ):
+            return
+        try:
+            self.storage.set_scheduler_state(
+                TASK_TRACKER_STATE_KEY,
+                self._task_tracker.to_json(),
+            )
+        except Exception:
+            logger.debug("Task tracker persist failed", exc_info=True)
+
+    def _persist_current_task_session(self) -> None:
+        if not self.config.tasks.enabled or self._task_tracker is None:
+            return
+        current = self._task_tracker.current_session
+        if current is None:
+            return
+        try:
+            self.storage.upsert_task_session(current)
+            self.storage.rebuild_task_daily_summary(current.started_at.date().isoformat())
+        except Exception:
+            logger.debug("Current task session persist failed", exc_info=True)
 
     @staticmethod
     def _format_signal_evidence(state) -> str:
@@ -456,19 +612,37 @@ class CoachScheduler:
 
     def _maybe_queue_task_confirm_inbox(self, state, now: datetime) -> None:
         key = f"task_confirm:{state.task_id}"
-        elapsed = self._notification_gate.seconds_since(key, now)
+        if self._task_confirm_count_date != now.date():
+            self._task_confirm_count_date = now.date()
+            self._task_confirm_count = 0
+
+        if (
+            self._task_confirm_count
+            >= self.config.report.delivery.task_confirm_daily_limit
+        ):
+            return
+
+        first_seen = self._task_confirm_candidates.setdefault(key, now)
+        required_seconds = self.config.report.delivery.task_confirm_min_minutes * 60
+        if (now - first_seen).total_seconds() < required_seconds:
+            return
+
+        sent_key = f"task_confirm_sent:{state.task_id}"
+        elapsed = self._notification_gate.seconds_since(sent_key, now)
         if elapsed is not None and elapsed < 3600:
             return
-        try:
-            self.storage.add_inbox_item(
-                signal_type="task_confirm",
-                severity=0.4,
-                evidence=f"无法确认当前任务：{state.task_label or state.task_id}",
-                reason="低置信度任务识别，请运行 aw-coach task confirm",
-            )
-            self._notification_gate.record_event(key, now)
-        except Exception:
-            logger.debug("Task confirm inbox failed", exc_info=True)
+
+        self._deliver_message(
+            kind="task_confirm",
+            title="AI Coach · task_confirm",
+            body=f"无法确认当前任务：{state.task_label or state.task_id}",
+            severity=0.4,
+            reason="低置信度任务识别，请运行 aw-coach task confirm",
+            now=now,
+            delivery=self.config.report.delivery.task_confirm,
+        )
+        self._notification_gate.record_event(sent_key, now)
+        self._task_confirm_count += 1
 
     def _apply_policy_decision(self, decision: ActionDecision, signal, now: datetime) -> None:
         """Execute the action chosen by the policy engine, respecting the state machine."""
@@ -488,16 +662,16 @@ class CoachScheduler:
                 )
                 return
             logger.info(f"Policy: inbox | {decision.reason} | {signal.signal_type}")
-            try:
-                self.storage.add_inbox_item(
-                    signal_type=signal.signal_type,
-                    severity=signal.severity,
-                    evidence=decision.evidence or signal.evidence,
-                    reason=decision.reason,
-                )
-                sm.transition_to(sm.state, signal_type=signal.signal_type, action="inbox")
-            except Exception:
-                logger.debug("Inbox save failed", exc_info=True)
+            self._deliver_message(
+                kind=signal.signal_type,
+                title=f"AI Coach · {signal.signal_type}",
+                body=decision.evidence or signal.evidence,
+                severity=signal.severity,
+                reason=decision.reason,
+                now=now,
+                delivery=self.config.report.delivery.medium_signal,
+            )
+            sm.transition_to(sm.state, signal_type=signal.signal_type, action="inbox")
             self._persist_state_machine()
             return
 
@@ -511,28 +685,122 @@ class CoachScheduler:
             logger.info(f"Policy: notify_now | {decision.reason} | {signal.signal_type}")
             try:
                 sm.transition_to(sm.state, signal_type=signal.signal_type, action="notify")
-                allowed, _reason = self._notification_gate.allow_notify(
-                    signal.signal_type, now=now
+                result = self._deliver_message(
+                    kind=signal.signal_type,
+                    title=f"AI Coach · {signal.signal_type}",
+                    body=decision.evidence or signal.evidence,
+                    severity=signal.severity,
+                    reason=decision.reason,
+                    now=now,
+                    delivery=self.config.report.delivery.high_severity_signal,
                 )
-                if allowed:
-                    send_notification(
-                        title=f"AI Coach · {signal.signal_type}",
-                        body=decision.evidence or signal.evidence,
-                    )
-                    self._notification_gate.record_notify(signal.signal_type, now)
-                else:
-                    self.storage.add_inbox_item(
+                if result.get("notified"):
+                    sm.record_notification()
+                    sm.transition_to(
+                        sm.state,
                         signal_type=signal.signal_type,
-                        severity=signal.severity,
-                        evidence=decision.evidence or signal.evidence,
-                        reason=f"通知被抑制: {_reason}",
+                        action="await_feedback",
                     )
-                sm.record_notification()
-                sm.transition_to(sm.state, signal_type=signal.signal_type, action="await_feedback")
             except Exception:
                 logger.debug("Notify failed", exc_info=True)
             self._persist_state_machine()
             return
+
+    def _record_delivery(
+        self,
+        kind: str,
+        channel: str,
+        status: str,
+        reason: str = "",
+        title: str = "",
+    ) -> None:
+        try:
+            self.storage.record_delivery(kind, channel, status, reason, title)
+        except Exception:
+            logger.debug("Delivery log save failed", exc_info=True)
+
+    def _delivery_for_kind(self, kind: str) -> str:
+        delivery = self.config.report.delivery
+        if kind == "summary":
+            return delivery.instant_summary
+        if kind == "daily_report":
+            return delivery.daily_report
+        if kind == "morning_brief":
+            return delivery.morning_brief
+        if kind == "task_confirm":
+            return delivery.task_confirm
+        return delivery.medium_signal
+
+    def _deliver_message(
+        self,
+        *,
+        kind: str,
+        title: str,
+        body: str,
+        severity: float,
+        reason: str,
+        now: datetime,
+        delivery: str,
+        detail_url: Optional[str] = None,
+    ) -> Dict[str, bool]:
+        """Deliver one user-facing message and log all channel outcomes."""
+        result = {"notified": False, "inbox": False}
+        if delivery == "off":
+            self._record_delivery(kind, "none", "suppressed", "delivery_off", title)
+            return result
+
+        wants_notify = delivery in {"notify", "both"}
+        wants_inbox = delivery in {"inbox", "both"}
+        inbox_reason = reason
+        require_budget = self._requires_notification_budget(kind, severity)
+
+        if wants_notify:
+            if not self._should_notify():
+                inbox_reason = "通知被抑制: cli_only"
+                self._record_delivery(kind, "notify", "suppressed", "cli_only", title)
+            else:
+                allowed, deny_reason = self._notification_gate.allow_notify(
+                    kind,
+                    now=now,
+                    require_budget=require_budget,
+                )
+                if allowed:
+                    sent = send_notification(title, body, detail_url=detail_url)
+                    if sent:
+                        self._notification_gate.record_notify(
+                            kind,
+                            now,
+                            consume_budget=require_budget,
+                        )
+                        result["notified"] = True
+                        self._record_delivery(kind, "notify", "sent", reason, title)
+                    else:
+                        inbox_reason = "通知发送失败，已转入 inbox"
+                        self._record_delivery(kind, "notify", "failed", "send_failed", title)
+                else:
+                    inbox_reason = f"通知被抑制: {deny_reason}"
+                    self._record_delivery(kind, "notify", "suppressed", deny_reason, title)
+
+        if wants_inbox or (wants_notify and not result["notified"]):
+            try:
+                self.storage.add_inbox_item(
+                    signal_type=kind,
+                    severity=severity,
+                    evidence=body,
+                    reason=inbox_reason,
+                )
+                result["inbox"] = True
+                self._record_delivery(kind, "inbox", "sent", inbox_reason, title)
+            except Exception:
+                self._record_delivery(kind, "inbox", "failed", "save_failed", title)
+                logger.debug("Inbox save failed", exc_info=True)
+        return result
+
+    def _requires_notification_budget(self, kind: str, severity: float) -> bool:
+        if severity >= 0.8:
+            return False
+        exempt = set(getattr(self.config.report, "notification_budget_exempt_kinds", []))
+        return kind not in exempt
 
     def _deliver_summary(
         self,
@@ -542,28 +810,25 @@ class CoachScheduler:
         *,
         now: datetime,
         detail_url: Optional[str] = None,
-        prefer_notify: bool = True,
+        prefer_notify: Optional[bool] = None,
+        delivery: Optional[str] = None,
     ) -> None:
         """Deliver summary via notify or inbox using NotificationGate."""
         self._save_summary_archive(kind, title, body, now)
-        if not self._should_notify():
-            return
 
-        allowed, reason = self._notification_gate.allow_notify(kind, now=now)
-        if prefer_notify and allowed:
-            send_notification(title, body, detail_url=detail_url)
-            self._notification_gate.record_notify(kind, now)
-            return
-
-        try:
-            self.storage.add_inbox_item(
-                signal_type=kind,
-                severity=0.5,
-                evidence=body,
-                reason=f"摘要存档（通知抑制: {reason}）",
-            )
-        except Exception:
-            logger.debug("Summary inbox save failed", exc_info=True)
+        selected = delivery or self._delivery_for_kind(kind)
+        if prefer_notify is not None:
+            selected = "notify" if prefer_notify else "inbox"
+        self._deliver_message(
+            kind=kind,
+            title=title,
+            body=body,
+            severity=0.5,
+            reason="摘要存档",
+            now=now,
+            detail_url=detail_url,
+            delivery=selected,
+        )
 
     def _save_summary_archive(self, kind: str, title: str, body: str, now: datetime) -> None:
         try:
@@ -614,6 +879,10 @@ class CoachScheduler:
     def bucket_id(self) -> str:
         return f"ai-coach_{self.collector.hostname}"
 
+    @property
+    def context_bucket_id(self) -> str:
+        return f"aw-coach-context_{self.collector.hostname}"
+
     def _ensure_bucket(self) -> None:
         if self._bucket_created:
             return
@@ -626,6 +895,92 @@ class CoachScheduler:
             self._bucket_created = True
         except Exception:
             self._bucket_created = True
+
+    def _ensure_context_bucket(self) -> None:
+        if self._context_bucket_created:
+            return
+        try:
+            self.collector.client.create_bucket(
+                self.context_bucket_id,
+                event_type="aw.coach.context",
+                queued=False,
+            )
+            self._context_bucket_created = True
+        except Exception:
+            self._context_bucket_created = True
+
+    def _capture_context_snapshot(self, now: datetime, latest):
+        cfg = getattr(self.config, "context_capture", None)
+        if cfg is None or not cfg.enabled:
+            return None
+
+        interval = max(10, int(cfg.interval_seconds))
+        if (
+            self._last_context_capture is not None
+            and (now - self._last_context_capture).total_seconds() < interval
+        ):
+            return None
+        self._last_context_capture = now
+
+        try:
+            from aw_coach.process_context import capture_process_context
+
+            snapshot = capture_process_context(
+                active_app=latest.primary_app,
+                command_args_mode=cfg.command_args_mode,
+                capture_cwd=cfg.capture_cwd,
+                capture_git=cfg.capture_git,
+            )
+        except Exception:
+            logger.debug("Context capture failed", exc_info=True)
+            return None
+
+        if snapshot is None:
+            return None
+
+        if not any(
+            [
+                snapshot.process_name,
+                snapshot.process_cwd,
+                snapshot.git_repo,
+                snapshot.terminal_command_summary,
+            ]
+        ):
+            return snapshot
+
+        try:
+            from aw_core.models import Event
+
+            self._ensure_context_bucket()
+            event = Event(
+                timestamp=_local_to_utc(now - timedelta(seconds=interval)),
+                duration=timedelta(seconds=interval),
+                data={
+                    "schema_version": 1,
+                    "type": "context_snapshot",
+                    "process_name": snapshot.process_name,
+                    "process_cwd": snapshot.process_cwd,
+                    "git_repo": snapshot.git_repo,
+                    "git_branch": snapshot.git_branch,
+                    "terminal_command_summary": snapshot.terminal_command_summary,
+                    "terminal_action": snapshot.terminal_action,
+                },
+            )
+            self.collector.client.insert_event(self.context_bucket_id, event)
+        except Exception:
+            logger.debug("Context snapshot write failed", exc_info=True)
+
+        return snapshot
+
+    def _annotate_task_slices(self, slices, rules) -> None:
+        if not self.config.tasks.enabled:
+            return
+        try:
+            from aw_coach.task_signals import annotate_task_slices
+
+            annotate_task_slices(slices, rules, self.config.tasks)
+        except Exception:
+            logger.debug("Historical task annotation failed", exc_info=True)
 
     def _restore_last_summary(self) -> datetime:
         """Restore last_summary from persistent storage."""
@@ -673,6 +1028,7 @@ class CoachScheduler:
         last_hourly = self._restore_last_hourly(datetime.now())
         last_summary = self._restore_last_summary()
         last_hourly = self._catch_up_hourly(last_hourly, datetime.now())
+        self._reconcile_recent_hourly(datetime.now())
         self._save_last_hourly(last_hourly)
         logger.info(f"  last_hourly restored: {last_hourly.strftime('%Y-%m-%d %H:%M')}")
         logger.info(f"  last_summary restored: {last_summary.strftime('%H:%M')}")
@@ -751,7 +1107,13 @@ class CoachScheduler:
                     f"Flushing partial hour: "
                     f"{last_boundary.strftime('%H:%M')}-{now.strftime('%H:%M')}"
                 )
-                self._hourly_analyze(last_boundary, now)
+                self._hourly_analyze(
+                    last_boundary,
+                    now,
+                    allow_llm=False,
+                    event_type="partial_hour_analysis",
+                )
+            self._persist_task_tracker()
         except Exception as e:
             logger.warning(f"Flush on shutdown failed (non-fatal): {e}")
         try:
@@ -766,7 +1128,7 @@ class CoachScheduler:
         if last_hourly >= target:
             return last_hourly
 
-        max_backfill_hours = 24
+        max_backfill_hours = max(1, self.config.report.hourly_backfill_hours)
         earliest = target - timedelta(hours=max_backfill_hours)
         if last_hourly < earliest:
             logger.info(
@@ -778,14 +1140,38 @@ class CoachScheduler:
         current = last_hourly
         while current < target:
             next_hour = current + timedelta(hours=1)
-            if not self._hourly_analyze(current, next_hour):
+            if not self._hourly_analyze(current, next_hour, allow_llm=False):
                 return current
             current = next_hour
             self._save_last_hourly(current)
 
         return current
 
-    def _hourly_analyze(self, hour_start: datetime, hour_end: datetime) -> bool:
+    def _reconcile_recent_hourly(self, now: datetime) -> None:
+        """Fill missing completed hourly events in the configured lookback window."""
+        target = self._prev_hour_boundary(now)
+        max_backfill_hours = max(1, self.config.report.hourly_backfill_hours)
+        current = target - timedelta(hours=max_backfill_hours)
+        while current < target:
+            next_hour = current + timedelta(hours=1)
+            if not self._event_exists("hourly_analysis", current, next_hour):
+                if not self._hourly_analyze(current, next_hour, allow_llm=False):
+                    logger.debug(
+                        "Hourly reconciliation stopped at %s-%s",
+                        current.isoformat(),
+                        next_hour.isoformat(),
+                    )
+                    return
+            current = next_hour
+
+    def _hourly_analyze(
+        self,
+        hour_start: datetime,
+        hour_end: datetime,
+        *,
+        allow_llm: bool = True,
+        event_type: str = "hourly_analysis",
+    ) -> bool:
         try:
             slices = self.collector.fetch_range(hour_start, hour_end)
         except Exception as e:
@@ -795,7 +1181,8 @@ class CoachScheduler:
         if not slices:
             return True
 
-        rules = self._classify_slices(slices)
+        rules = self._classify_slices(slices, allow_llm=allow_llm)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         # Determine dominant activity type
@@ -807,10 +1194,11 @@ class CoachScheduler:
 
         # Write to ai-coach bucket
         self._ensure_bucket()
-        if self._event_exists("hourly_analysis", hour_start, hour_end):
+        if self._event_exists(event_type, hour_start, hour_end):
             logger.info(
-                f"Hourly analysis already exists: {hour_start.strftime('%H:%M')}-"
-                f"{hour_end.strftime('%H:%M')}"
+                f"Hourly analysis already exists: "
+                f"{hour_start.strftime('%Y-%m-%d %H:%M')}-"
+                f"{hour_end.strftime('%Y-%m-%d %H:%M')}"
             )
             return True
 
@@ -821,8 +1209,8 @@ class CoachScheduler:
                 timestamp=_local_to_utc(hour_start),
                 duration=timedelta(seconds=int((hour_end - hour_start).total_seconds())),
                 data={
-                    "schema_version": 2,
-                    "type": "hourly_analysis",
+                    "schema_version": ANALYSIS_SCHEMA_VERSION,
+                    "type": event_type,
                     "period_start": hour_start.isoformat(),
                     "period_end": hour_end.isoformat(),
                     "activity_type": top_type,
@@ -830,6 +1218,7 @@ class CoachScheduler:
                     "classification_method": method,
                     "focus_score": analysis.focus_score,
                     "switch_count": analysis.switch_count,
+                    "task_switch_count": analysis.task_switch_count,
                     "effective_hours": round(analysis.effective_hours, 3),
                     "deep_work_hours": round(analysis.deep_work_hours, 3),
                     "productivity_score": analysis.productivity_score,
@@ -837,12 +1226,20 @@ class CoachScheduler:
                     "activity_breakdown": {
                         k: round(v, 3) for k, v in analysis.activity_breakdown.items()
                     },
+                    "task_breakdown": {
+                        k: round(v, 3) for k, v in analysis.task_breakdown.items()
+                    },
+                    "task_deep_work_breakdown": {
+                        k: round(v, 3)
+                        for k, v in analysis.task_deep_work_breakdown.items()
+                    },
                 },
             )
             self.collector.client.insert_event(self.bucket_id, event)
             logger.info(
-                f"Hourly analysis written: {hour_start.strftime('%H:%M')}-"
-                f"{hour_end.strftime('%H:%M')} "
+                f"Hourly analysis written: "
+                f"{hour_start.strftime('%Y-%m-%d %H:%M')}-"
+                f"{hour_end.strftime('%Y-%m-%d %H:%M')} "
                 f"effective={analysis.effective_hours:.1f}h focus={analysis.focus_score}"
             )
         except Exception as e:
@@ -891,6 +1288,11 @@ class CoachScheduler:
         for event in events:
             data = getattr(event, "data", {})
             if data.get("type") != event_type:
+                continue
+            if (
+                event_type == "hourly_analysis"
+                and data.get("schema_version", 0) < ANALYSIS_SCHEMA_VERSION
+            ):
                 continue
             if data.get("period_start") == target_start and data.get("period_end") == target_end:
                 return True
@@ -950,7 +1352,7 @@ class CoachScheduler:
         detail_url: Optional[str] = None,
         active_signals: Optional[List[str]] = None,
         silent_on_failure: bool = False,
-        prefer_notify_fallback: bool = True,
+        prefer_notify_fallback: Optional[bool] = None,
     ) -> None:
         if not self.config.report.background_ai_summary:
             self._deliver_summary(
@@ -965,11 +1367,16 @@ class CoachScheduler:
 
         semantic = self._semantic_payload
         corrections = self.storage.get_corrections_last_30_days()
-        cost = self._get_cost_controller()
         task_sessions = self._get_task_sessions_for_summary()
         config = self.config
 
         def _work():
+            from aw_coach.ai.cost import CostController
+            from aw_coach.storage import Storage
+
+            # The scheduler's Storage connection belongs to the daemon thread.
+            # Background workers need their own SQLite connection.
+            cost = CostController(config.cost, Storage(config.db_path))
             return generate_background_summary(
                 analysis,
                 config,
@@ -995,11 +1402,43 @@ class CoachScheduler:
             "detail_url": detail_url,
             "silent": silent_on_failure,
             "prefer_notify": prefer_notify_fallback,
+            "submitted_at": datetime.now(),
+            "timeout_seconds": self.config.report.llm_timeout_seconds,
         }
 
     def _poll_summary_future(self) -> None:
         pending = getattr(self, "_pending_summary_delivery", None)
-        if self._summary_future is None or not self._summary_future.done():
+        if self._summary_future is None:
+            return
+
+        if pending is not None and not self._summary_future.done():
+            submitted_at = pending.get("submitted_at")
+            timeout_seconds = pending.get(
+                "timeout_seconds", self.config.report.llm_timeout_seconds
+            )
+            if (
+                isinstance(submitted_at, datetime)
+                and (datetime.now() - submitted_at).total_seconds() >= timeout_seconds
+            ):
+                logger.warning(
+                    "Background summary timed out after %ss; using fallback",
+                    timeout_seconds,
+                )
+                self._summary_future.cancel()
+                self._summary_future = None
+                if not pending.get("silent"):
+                    self._deliver_summary(
+                        pending["kind"],
+                        pending["title"],
+                        pending["fallback_body"],
+                        now=pending["now"],
+                        detail_url=pending.get("detail_url"),
+                        prefer_notify=pending.get("prefer_notify", True),
+                    )
+                self._pending_summary_delivery = None
+            return
+
+        if not self._summary_future.done():
             return
         try:
             ai_text = self._summary_future.result()
@@ -1021,9 +1460,53 @@ class CoachScheduler:
             body,
             now=pending["now"],
             detail_url=pending.get("detail_url"),
-            prefer_notify=ai_text is not None and pending.get("prefer_notify", True),
+            prefer_notify=pending.get("prefer_notify", True),
         )
         self._pending_summary_delivery = None
+
+    def _generate_ai_summary_with_timeout(
+        self,
+        analysis,
+        *,
+        active_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Generate an AI summary with a bounded wait and worker-local storage."""
+        config = self.config
+        semantic = self._semantic_payload
+        corrections = self.storage.get_corrections_last_30_days()
+        task_sessions = self._get_task_sessions_for_summary()
+
+        def _work():
+            from aw_coach.ai.cost import CostController
+            from aw_coach.storage import Storage
+
+            cost = CostController(config.cost, Storage(config.db_path))
+            return generate_background_summary(
+                analysis,
+                config,
+                cost_controller=cost,
+                semantic_state=semantic,
+                corrections=corrections,
+                task_sessions=task_sessions,
+                active_signals=active_signals,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aw-coach-ai-once")
+        future = executor.submit(_work)
+        try:
+            return future.result(timeout=self.config.report.llm_timeout_seconds)
+        except TimeoutError:
+            future.cancel()
+            logger.warning(
+                "AI summary timed out after %ss; using fallback",
+                self.config.report.llm_timeout_seconds,
+            )
+            return None
+        except Exception:
+            logger.debug("AI summary failed", exc_info=True)
+            return None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _send_instant_summary(self, now: datetime) -> None:
         interval = self.config.report.instant_summary_interval_hours
@@ -1038,6 +1521,7 @@ class CoachScheduler:
             return
 
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         detail_url = None
@@ -1087,6 +1571,7 @@ class CoachScheduler:
         if not slices:
             return
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
         fallback = self._build_rule_summary_body(analysis, (now - start).total_seconds() / 3600)
         self._submit_background_summary(
@@ -1113,6 +1598,7 @@ class CoachScheduler:
             return False
 
         rules = self._classify_slices(slices)
+        self._annotate_task_slices(slices, rules)
         analysis = self.analyzer.analyze(slices, rules)
 
         use_ai = self.config.report.background_ai_summary and self.config.ai.backend != "rule_only"
@@ -1120,30 +1606,28 @@ class CoachScheduler:
         self._persist_task_sessions_for_day(report_date)
         task_breakdown = None
         if self.config.tasks.enabled:
+            task_rows = self.storage.get_task_session_summary(report_date.isoformat())
             task_breakdown = {
+                row["label"]: row["total_sec"] / 3600
+                for row in task_rows
+            } or analysis.task_breakdown or {
                 row["label"]: row["total_sec"] / 3600
                 for row in self.storage.get_task_daily_summary(report_date.isoformat())
             }
         inbox_items = self.storage.get_inbox_items(dismissed=False, limit=10)
+        daily_insights = self._get_or_generate_daily_insights(report_date, analysis)
         report_text = self.reporter.generate_daily(
             report_date,
             analysis,
             use_ai=use_ai,
             project_breakdown=task_breakdown,
             inbox_items=inbox_items,
+            daily_insights=daily_insights,
         )
 
         ai_summary = None
         if use_ai:
-            cost = self._get_cost_controller()
-            ai_summary = generate_background_summary(
-                analysis,
-                self.config,
-                cost_controller=cost,
-                semantic_state=self._semantic_payload,
-                corrections=self.storage.get_corrections_last_30_days(),
-                task_sessions=self._get_task_sessions_for_summary(),
-            )
+            ai_summary = self._generate_ai_summary_with_timeout(analysis)
             if ai_summary:
                 report_text += f"\n\n## AI 总结\n\n{ai_summary}\n"
 
@@ -1170,6 +1654,7 @@ class CoachScheduler:
                     "deep_work_hours": round(analysis.deep_work_hours, 2),
                     "focus_score": analysis.focus_score,
                     "switch_count": analysis.switch_count,
+                    "task_switch_count": analysis.task_switch_count,
                 },
             )
             self.collector.client.insert_event(self.bucket_id, event)
@@ -1195,9 +1680,25 @@ class CoachScheduler:
             notify_body,
             now=datetime.now(),
             detail_url=detail_url,
-            prefer_notify=False,
+            delivery=self.config.report.delivery.daily_report,
         )
         return True
+
+    def _get_or_generate_daily_insights(self, report_date: date, analysis) -> List[Dict]:
+        try:
+            from aw_coach.daily_insights import generate_daily_insights
+
+            day = report_date.isoformat()
+            rows = self.storage.get_daily_insights(day)
+            if rows:
+                return rows
+            insights = generate_daily_insights(report_date, self.storage, analysis)
+            if insights:
+                self.storage.save_daily_insights(day, insights)
+            return self.storage.get_daily_insights(day)
+        except Exception:
+            logger.debug("Daily insight generation failed", exc_info=True)
+            return []
 
     def _run_due_cron_jobs(self, now: datetime) -> None:
         for job in self._cron_runner.due_jobs(now):
@@ -1208,6 +1709,7 @@ class CoachScheduler:
                     self._cron_runner.mark_run(job, now)
                     continue
                 rules = self._classify_slices(slices)
+                self._annotate_task_slices(slices, rules)
                 analysis = self.analyzer.analyze(slices, rules)
                 fallback = self._build_rule_summary_body(analysis, 4)
                 title = f"AI Coach · {job.template}"
@@ -1229,40 +1731,19 @@ class CoachScheduler:
         """Persist drained completed sessions without flushing the active one."""
         if not self.config.tasks.enabled or self._task_tracker is None:
             return
-        totals: Dict[tuple, Dict] = {}
+        changed_days: set[str] = set()
         for session in self._task_tracker.drain_completed():
             try:
-                self.storage.save_task_session(
-                    task_id=session.task_id,
-                    label=session.label,
-                    project=session.project,
-                    intent=session.intent,
-                    started_at=session.started_at.isoformat(),
-                    ended_at=session.ended_at.isoformat() if session.ended_at else None,
-                    accumulated_sec=session.accumulated_sec,
-                    modes=session.modes,
-                    blockers=session.blockers,
-                    outcome=session.outcome,
-                    confidence=session.confidence,
-                )
+                self.storage.upsert_task_session(session)
+                changed_days.add(session.started_at.date().isoformat())
             except Exception:
                 logger.debug("Task session persist failed", exc_info=True)
-            day = session.started_at.date().isoformat()
-            entry = totals.setdefault(
-                (day, session.task_id),
-                {"label": session.label, "total_sec": 0.0},
-            )
-            entry["total_sec"] += session.accumulated_sec
-        for (day, task_id), entry in totals.items():
+        for day in changed_days:
             try:
-                self.storage.upsert_task_daily_summary(
-                    day,
-                    task_id,
-                    entry["label"],
-                    entry["total_sec"],
-                )
+                self.storage.rebuild_task_daily_summary(day)
             except Exception:
                 logger.debug("Task daily summary persist failed", exc_info=True)
+        self._persist_task_tracker()
 
     def _persist_task_sessions_for_day(self, report_date: date) -> None:
         if not self.config.tasks.enabled or self._task_tracker is None:

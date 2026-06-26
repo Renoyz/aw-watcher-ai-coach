@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from aw_coach.collector import ActivitySlice
 from aw_coach.config import TasksConfig
 from aw_coach.enriched_state import SemanticWorkState
+from aw_coach.rules.engine import RuleResult
 from aw_coach.task_fusion import TaskFusionEngine
-from aw_coach.task_signals import TaskSignalExtractor
+from aw_coach.task_signals import TaskSignalExtractor, annotate_task_slices
 from aw_coach.task_tracker import TaskSessionTracker
 
 
@@ -82,6 +84,60 @@ class TestTaskSignals:
         )
         assert not task.task_id.startswith("ssh:")
 
+    def test_annotate_task_slices_prefers_git_repo(self):
+        start = datetime(2026, 6, 11, 10, 0)
+        slices = [
+            ActivitySlice(
+                start=start,
+                end=start + timedelta(minutes=10),
+                duration=600,
+                is_afk=False,
+                primary_app="gnome-terminal",
+                primary_title="pytest",
+                git_repo="aw-coach",
+                git_branch="feat/context",
+                terminal_action="testing",
+            )
+        ]
+        rules = [RuleResult("programming", 0.9, "rule")]
+
+        annotate_task_slices(slices, rules, TasksConfig())
+
+        assert slices[0].semantic_project == "aw-coach"
+        assert slices[0].task_id == "aw-coach:feat/context"
+        assert slices[0].task_confidence >= 0.75
+
+    def test_support_activity_inherits_confirmed_project(self):
+        start = datetime(2026, 6, 11, 10, 0)
+        slices = [
+            ActivitySlice(
+                start=start,
+                end=start + timedelta(minutes=5),
+                duration=300,
+                is_afk=False,
+                primary_app="Code",
+                primary_title="main.py - aw-coach",
+            ),
+            ActivitySlice(
+                start=start + timedelta(minutes=5),
+                end=start + timedelta(minutes=12),
+                duration=420,
+                is_afk=False,
+                primary_app="Chrome",
+                primary_title="Python docs",
+                web_url="https://docs.python.org/3/",
+            ),
+        ]
+        rules = [
+            RuleResult("programming", 0.9, "rule"),
+            RuleResult("research", 0.5, "rule"),
+        ]
+
+        annotate_task_slices(slices, rules, TasksConfig())
+
+        assert slices[1].semantic_project == "aw-coach"
+        assert slices[1].task_id.startswith("aw-coach:")
+
     def test_browser_webmail_no_ssh_signal(self):
         ext = TaskSignalExtractor(TasksConfig())
         task = ext.extract(
@@ -122,3 +178,55 @@ class TestTaskTracker:
         later = now + timedelta(minutes=2)
         tracker.update(task, _state(), later)
         assert session.accumulated_sec >= 60
+
+    def test_tracker_snapshot_restores_active_session(self):
+        from aw_coach.task_models import WorkTask
+
+        tracker = TaskSessionTracker()
+        start = datetime(2026, 6, 11, 10, 0)
+        task = WorkTask("aw-coach:main.py", "main.py", "aw-coach", "implement", 0.7)
+        tracker.update(task, _state(), start)
+        tracker.update(task, _state(), start + timedelta(minutes=2))
+
+        restored = TaskSessionTracker.from_json(tracker.to_json())
+        session = restored.update(task, _state(), start + timedelta(minutes=4))
+
+        assert session.started_at == start
+        assert session.accumulated_sec >= 300
+
+    def test_tracker_restore_caps_offline_gap(self):
+        from aw_coach.task_models import WorkTask
+
+        tracker = TaskSessionTracker()
+        start = datetime(2026, 6, 11, 10, 0)
+        task = WorkTask("aw-coach:main.py", "main.py", "aw-coach", "implement", 0.7)
+        tracker.update(task, _state(), start)
+
+        restored = TaskSessionTracker.from_json(tracker.to_json())
+        session = restored.update(task, _state(), start + timedelta(hours=1))
+
+        assert session.accumulated_sec == 360
+
+    def test_tracker_restores_from_active_session(self):
+        from aw_coach.task_models import TaskSession, WorkTask
+
+        start = datetime(2026, 6, 11, 10, 0)
+        active = TaskSession(
+            task_id="aw-coach:main.py",
+            label="main.py",
+            project="aw-coach",
+            intent="implement",
+            started_at=start,
+            accumulated_sec=180,
+            confidence=0.7,
+        )
+
+        tracker = TaskSessionTracker.from_active_session(
+            active,
+            last_update=start + timedelta(minutes=3),
+        )
+        task = WorkTask("aw-coach:main.py", "main.py", "aw-coach", "implement", 0.7)
+        session = tracker.update(task, _state(), start + timedelta(minutes=4))
+
+        assert session.started_at == start
+        assert session.accumulated_sec == 240

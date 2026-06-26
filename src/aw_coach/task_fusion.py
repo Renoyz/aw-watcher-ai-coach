@@ -29,6 +29,23 @@ class TaskFusionEngine:
     def state(self) -> TaskFusionState:
         return self._state
 
+    def restore_confirmed(
+        self,
+        *,
+        task_id: str,
+        label: str,
+        project: Optional[str],
+        intent: str,
+        confidence: float,
+    ) -> None:
+        self._state.confirmed_task_id = task_id
+        self._state.confirmed_label = label
+        self._state.confirmed_project = project
+        self._state.confirmed_intent = intent
+        self._state.confirmed_confidence = confidence
+        self._state.pending_task_id = None
+        self._state.pending_count = 0
+
     def resolve(self, candidate: WorkTask) -> WorkTask:
         if self._state.confirmed_task_id is None:
             self._confirm(candidate)

@@ -32,6 +32,21 @@ _MODE_TO_INTENT = {
     "terminal": "operate",
 }
 
+_ACTIVITY_TO_MODE = {
+    "programming": "coding",
+    "ai_assisted": "ai_coding",
+    "writing": "writing",
+    "design": "editing",
+    "research": "researching",
+    "meeting": "meeting",
+    "admin": "browsing",
+    "social": "chatting",
+    "entertainment": "browsing",
+    "terminal": "terminal",
+}
+
+_SUPPORT_ACTIVITY_TYPES = {"research", "ai_assisted"}
+
 
 def _normalize_project(project: Optional[str], config: TasksConfig) -> Optional[str]:
     if not project:
@@ -146,6 +161,8 @@ class TaskSignalExtractor:
             candidates.append((tid, label, None, "issue", conf))
             evidence.append(TaskEvidence("url", url or "", conf))
 
+        if git_ctx and git_ctx.repo_name and not project:
+            project = git_ctx.repo_name
         project = _normalize_project(project, self.config)
 
         # Webmail-like browser titles (user@mail.com: subject) are not SSH prompts
@@ -186,3 +203,56 @@ class TaskSignalExtractor:
             confidence=best[4],
             evidence=evidence,
         )
+
+
+def _mode_for_slice(activity_type: str, action_hint: Optional[str]) -> str:
+    if action_hint:
+        return action_hint
+    return _ACTIVITY_TO_MODE.get(activity_type, "unknown")
+
+
+def annotate_task_slices(slices, rules, config: TasksConfig) -> None:
+    """Annotate historical ActivitySlice objects with fused task identity."""
+    if not config.enabled or not slices:
+        return
+
+    from aw_coach.task_fusion import TaskFusionEngine
+
+    extractor = TaskSignalExtractor(config)
+    fusion = TaskFusionEngine()
+    parser = TitleParser()
+
+    paired = sorted(zip(slices, rules), key=lambda item: item[0].start)
+    for s, r in paired:
+        ctx = parser.parse(s.primary_app, s.primary_title, s.web_url)
+        git_ctx = None
+        if getattr(s, "git_repo", None) or getattr(s, "git_branch", None):
+            git_ctx = GitContext(repo_name=s.git_repo, branch=s.git_branch)
+
+        project = s.git_repo or ctx.project
+        if (
+            not project
+            and r.activity_type in _SUPPORT_ACTIVITY_TYPES
+            and fusion.state.confirmed_project
+        ):
+            project = fusion.state.confirmed_project
+
+        likely_mode = _mode_for_slice(
+            r.activity_type,
+            getattr(s, "terminal_action", None) or ctx.action_hint,
+        )
+        candidate = extractor.extract(
+            app=s.primary_app,
+            title=s.primary_title,
+            url=s.web_url,
+            likely_mode=likely_mode,
+            activity_type=r.activity_type,
+            git_ctx=git_ctx,
+            filename=ctx.filename,
+            project=project,
+        )
+        task = fusion.resolve(candidate)
+        s.semantic_project = task.project
+        s.task_id = task.task_id
+        s.task_label = task.label
+        s.task_confidence = task.confidence

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from aw_coach.enriched_state import SemanticWorkState
-from aw_coach.task_models import TaskSession, WorkTask
+from aw_coach.task_models import TaskEvidence, TaskSession, WorkTask
 
 MERGE_GAP_SEC = 300
 ORPHAN_SEC = 120
@@ -26,7 +27,15 @@ class TaskSessionTracker:
     def completed_sessions(self) -> List[TaskSession]:
         return list(self._completed)
 
-    def update(self, task: WorkTask, state: SemanticWorkState, now: datetime) -> TaskSession:
+    def update(
+        self,
+        task: WorkTask,
+        state: SemanticWorkState,
+        now: datetime,
+        *,
+        evidence: Optional[List[TaskEvidence]] = None,
+        source: Optional[Dict[str, Any]] = None,
+    ) -> TaskSession:
         elapsed = 60.0
         if self._last_update is not None:
             elapsed = min((now - self._last_update).total_seconds(), 300.0)
@@ -42,9 +51,16 @@ class TaskSessionTracker:
                 intent=task.intent,
                 started_at=now,
                 confidence=task.confidence,
+                evidence=list(evidence or task.evidence),
+                source=dict(source or {}),
             )
 
         self._current.accumulated_sec += elapsed
+        self._merge_evidence(self._current, evidence or task.evidence)
+        if source:
+            self._current.source.update(
+                {key: value for key, value in source.items() if value is not None}
+            )
         if state.likely_mode and state.likely_mode not in self._current.modes:
             self._current.modes.append(state.likely_mode)
         if state.detected_signal and state.detected_signal not in self._current.blockers:
@@ -113,3 +129,85 @@ class TaskSessionTracker:
         drained = self._completed
         self._completed = []
         return drained
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current": self._session_to_dict(self._current),
+            "completed": [
+                self._session_to_dict(session) for session in self._completed
+            ],
+            "last_update": self._last_update.isoformat() if self._last_update else None,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "TaskSessionTracker":
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return cls()
+        tracker = cls()
+        tracker._current = cls._session_from_dict(data.get("current"))
+        completed = data.get("completed") or []
+        if isinstance(completed, list):
+            tracker._completed = [
+                session
+                for session in (cls._session_from_dict(item) for item in completed)
+                if session is not None
+            ]
+        tracker._last_update = cls._parse_datetime(data.get("last_update"))
+        return tracker
+
+    @classmethod
+    def from_active_session(
+        cls,
+        session: TaskSession,
+        *,
+        last_update: Optional[datetime] = None,
+    ) -> "TaskSessionTracker":
+        tracker = cls()
+        tracker._current = session
+        tracker._last_update = last_update or session.ended_at or session.started_at
+        return tracker
+
+    @staticmethod
+    def _session_to_dict(session: Optional[TaskSession]) -> Optional[Dict[str, Any]]:
+        if session is None:
+            return None
+        return session.to_dict()
+
+    @classmethod
+    def _session_from_dict(cls, data: Any) -> Optional[TaskSession]:
+        if not isinstance(data, dict):
+            return None
+        try:
+            return TaskSession.from_dict(data)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _merge_evidence(
+        session: TaskSession,
+        evidence: Optional[List[TaskEvidence]],
+    ) -> None:
+        if not evidence:
+            return
+        seen = {(item.source, item.value) for item in session.evidence}
+        for item in evidence:
+            key = (item.source, item.value)
+            if key in seen:
+                continue
+            session.evidence.append(item)
+            seen.add(key)
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None

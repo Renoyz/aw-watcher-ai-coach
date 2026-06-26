@@ -71,6 +71,71 @@ class TestDeepWork:
         result = analyzer.analyze(slices, rules)
         assert result.deep_work_hours >= 20 / 60
 
+    def test_deep_work_chain_allows_workflow_transitions(self, analyzer):
+        """Coding with docs/research in between stays one deep work chain."""
+        slices = [_slice(9, 0, 10), _slice(9, 10, 8), _slice(9, 18, 7)]
+        rules = [_rule("programming"), _rule("research"), _rule("programming")]
+        result = analyzer.analyze(slices, rules)
+        assert result.deep_work_hours >= 25 / 60
+
+    def test_ai_assisted_extends_existing_deep_chain(self, analyzer):
+        """AI support counts when attached to an existing coding context."""
+        slices = [_slice(9, 0, 5), _slice(9, 5, 12), _slice(9, 17, 5)]
+        rules = [_rule("programming"), _rule("ai_assisted"), _rule("programming")]
+        result = analyzer.analyze(slices, rules)
+        assert result.deep_work_hours >= 22 / 60
+
+    def test_isolated_ai_assisted_not_deep(self, analyzer):
+        """A standalone AI chat should not start a deep work block by itself."""
+        slices = [_slice(9, 0, 30, app="chrome")]
+        rules = [_rule("ai_assisted")]
+        result = analyzer.analyze(slices, rules)
+        assert result.deep_work_hours == 0.0
+
+    def test_low_confidence_research_not_deep_by_itself(self, analyzer):
+        """Generic browser research should not become deep work alone."""
+        slices = [_slice(9, 0, 30, app="chrome")]
+        rules = [_rule("research", confidence=0.5)]
+        result = analyzer.analyze(slices, rules)
+        assert result.deep_work_hours == 0.0
+
+    def test_search_research_can_support_existing_deep_chain(self, analyzer):
+        """A brief troubleshooting search can support an active coding chain."""
+        search = _slice(9, 5, 8, app="chrome")
+        search.site_type = "search"
+        slices = [_slice(9, 0, 5), search, _slice(9, 13, 5)]
+        rules = [
+            _rule("programming"),
+            _rule("research", confidence=0.5),
+            _rule("programming"),
+        ]
+        result = analyzer.analyze(slices, rules)
+        assert result.deep_work_hours >= 18 / 60
+
+    def test_different_task_breaks_deep_chain(self, analyzer):
+        slices = [_slice(9, 0, 10), _slice(9, 10, 10)]
+        slices[0].task_id = "api:implement"
+        slices[0].task_label = "api"
+        slices[1].task_id = "web:implement"
+        slices[1].task_label = "web"
+        rules = [_rule("programming"), _rule("programming")]
+
+        result = analyzer.analyze(slices, rules)
+
+        assert result.deep_work_hours == 0.0
+
+    def test_same_task_tracks_deep_breakdown(self, analyzer):
+        slices = [_slice(9, 0, 10), _slice(9, 10, 10, app="chrome")]
+        for s in slices:
+            s.task_id = "api:implement"
+            s.task_label = "api"
+        rules = [_rule("programming"), _rule("research")]
+
+        result = analyzer.analyze(slices, rules)
+
+        assert result.deep_work_hours >= 20 / 60
+        assert result.task_deep_work_breakdown["api"] >= 20 / 60
+
     def test_entertainment_not_deep(self, analyzer):
         """Entertainment never counts as deep work."""
         slices = [_slice(9, 0, 60)]
@@ -128,6 +193,32 @@ class TestSwitchCount:
         rules = [_rule("programming"), _rule("ai_assisted")]
         result = analyzer.analyze(slices, rules)
         assert result.switch_count == 0
+
+    def test_same_task_workflow_has_no_semantic_switch(self, analyzer):
+        slices = [_slice(9, 0, 10), _slice(9, 10, 10, app="chrome")]
+        for s in slices:
+            s.task_id = "api:implement"
+            s.task_label = "api"
+        rules = [_rule("programming"), _rule("research")]
+
+        result = analyzer.analyze(slices, rules)
+
+        assert result.switch_count >= 1
+        assert result.task_switch_count == 0
+        assert result.task_breakdown["api"] == pytest.approx(20 / 60, abs=0.01)
+
+    def test_different_tasks_count_semantic_switch(self, analyzer):
+        slices = [_slice(9, 0, 10), _slice(9, 10, 10)]
+        slices[0].task_id = "api:implement"
+        slices[0].task_label = "api"
+        slices[1].task_id = "web:implement"
+        slices[1].task_label = "web"
+        rules = [_rule("programming"), _rule("programming")]
+
+        result = analyzer.analyze(slices, rules)
+
+        assert result.switch_count == 0
+        assert result.task_switch_count == 1
 
     def test_brief_flicker_not_counted(self, analyzer):
         """A brief (<30s) type change should not count as a real switch."""

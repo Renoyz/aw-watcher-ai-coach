@@ -23,6 +23,9 @@ def sample_analysis():
             "admin": 0.4,
         },
         hourly_scores=[(9, 85), (10, 78), (11, 62), (14, 75), (15, 55), (16, 35)],
+        task_switch_count=4,
+        task_breakdown={"api": 3.0, "docs": 1.0},
+        task_deep_work_breakdown={"api": 1.5},
     )
 
 
@@ -42,11 +45,15 @@ class TestDailyReport:
         assert "2.25" in report or "2.2" in report  # deep work
         assert "72" in report  # focus score
         assert "23" in report  # switch count
+        assert "任务切换" in report
+        assert "4" in report
 
     def test_contains_activity_breakdown(self, generator, sample_analysis):
         report = generator.generate_daily(date(2026, 5, 30), sample_analysis)
         assert "programming" in report
         assert "meeting" in report
+        assert "api" in report
+        assert "深度 1.5h" in report
 
     def test_contains_energy_curve(self, generator, sample_analysis):
         report = generator.generate_daily(date(2026, 5, 30), sample_analysis)
@@ -57,6 +64,28 @@ class TestDailyReport:
         report = generator.generate_daily(date(2026, 5, 30), sample_analysis)
         assert report.startswith("#")
         assert "##" in report
+
+    def test_daily_insights_section_is_optional(self, generator, sample_analysis):
+        report = generator.generate_daily(
+            date(2026, 5, 30),
+            sample_analysis,
+            daily_insights=[
+                {
+                    "date": "2026-05-30",
+                    "kind": "fragmented_main_task",
+                    "title": "主任务被切成多段",
+                    "body": "api 今天被拆成多段。",
+                    "evidence": [{"task": "api", "segments": 4, "longest_minutes": 20}],
+                    "suggestion": "先看最近任务时间轴恢复上下文。",
+                    "severity": 0.8,
+                    "confidence": 0.7,
+                }
+            ],
+        )
+
+        assert "## 额外观察" in report
+        assert "主任务被切成多段" in report
+        assert "可以尝试" in report
 
 
 class TestStatusOutput:

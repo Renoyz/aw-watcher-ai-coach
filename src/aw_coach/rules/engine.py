@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from aw_coach.rules.loader import AppRule, SubRule, load_rules_from_dirs
 
@@ -149,10 +150,41 @@ class RuleEngine:
 
         if sub.match_urls and url_lower:
             for pattern in sub.match_urls:
-                if pattern.lower() in url_lower:
+                if self._url_pattern_matches(pattern, url_lower):
                     return True
 
         return False
+
+    @staticmethod
+    def _url_pattern_matches(pattern: str, url_lower: str) -> bool:
+        pattern = pattern.strip().lower()
+        if not pattern:
+            return False
+
+        parsed = urlparse(url_lower)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if not host:
+            return pattern in url_lower
+
+        if "://" in pattern:
+            parsed_pattern = urlparse(pattern)
+            pattern_host = parsed_pattern.netloc.lower()
+            pattern_path = parsed_pattern.path.lower()
+        elif "/" in pattern:
+            pattern_host, raw_path = pattern.split("/", 1)
+            pattern_path = "/" + raw_path
+        else:
+            pattern_host = pattern
+            pattern_path = ""
+
+        if "." in pattern_host and not pattern_host.startswith("."):
+            host_matches = host == pattern_host or host.endswith(f".{pattern_host}")
+            if not host_matches:
+                return False
+            return not pattern_path or path.startswith(pattern_path)
+
+        return pattern in url_lower
 
     def has_confident_rule(self, app: str) -> bool:
         rule = self._app_index.get(app.lower())

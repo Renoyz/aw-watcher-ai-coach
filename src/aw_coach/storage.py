@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from os import PathLike
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from aw_coach.task_models import TaskSession, stable_session_uid
+from aw_coach.time_utils import now_local_iso
 
 
 class Storage:
@@ -138,7 +142,111 @@ class Storage:
                 PRAGMA user_version = 6;
             """)
 
+        if version < 7:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS delivery_log (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_delivery_log_time
+                    ON delivery_log(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_delivery_log_kind
+                    ON delivery_log(kind, status);
+                PRAGMA user_version = 7;
+            """)
+
+        if version < 8:
+            self._migrate_task_session_ledger()
+            self._conn.execute("PRAGMA user_version = 8")
+
+        if version < 9:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS daily_insights (
+                    id INTEGER PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    suggestion TEXT NOT NULL DEFAULT '',
+                    severity REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    source_version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(date, kind, title)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_insights_date
+                    ON daily_insights(date);
+                PRAGMA user_version = 9;
+            """)
+
         self._conn.commit()
+
+    def _table_columns(self, table: str) -> set[str]:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {row["name"] for row in rows}
+
+    def _add_column_if_missing(self, table: str, name: str, definition: str) -> None:
+        if name not in self._table_columns(table):
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    def _migrate_task_session_ledger(self) -> None:
+        self._add_column_if_missing("task_sessions", "session_uid", "TEXT")
+        self._add_column_if_missing(
+            "task_sessions",
+            "updated_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column_if_missing(
+            "task_sessions",
+            "evidence_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        self._add_column_if_missing(
+            "task_sessions",
+            "source_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._add_column_if_missing(
+            "task_sessions",
+            "version",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
+
+        rows = self._conn.execute(
+            "SELECT id, task_id, started_at, session_uid FROM task_sessions "
+            "ORDER BY id"
+        ).fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                started_at = datetime.fromisoformat(row["started_at"])
+                uid = row["session_uid"] or stable_session_uid(
+                    row["task_id"], started_at
+                )
+            except (TypeError, ValueError):
+                uid = row["session_uid"] or f"legacy-{row['id']}"
+            if uid in seen:
+                uid = f"{uid}-{row['id']}"
+            seen.add(uid)
+            if row["session_uid"] != uid:
+                self._conn.execute(
+                    "UPDATE task_sessions SET session_uid = ? WHERE id = ?",
+                    (uid, row["id"]),
+                )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_sessions_uid "
+            "ON task_sessions(session_uid)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_sessions_outcome "
+            "ON task_sessions(outcome, started_at)"
+        )
 
     # === Cost Log ===
 
@@ -314,8 +422,8 @@ class Storage:
     ) -> int:
         cursor = self._conn.execute(
             "INSERT INTO inbox (timestamp, signal_type, severity, evidence, reason) "
-            "VALUES (datetime('now'), ?, ?, ?, ?)",
-            (signal_type, severity, evidence, reason),
+            "VALUES (?, ?, ?, ?, ?)",
+            (now_local_iso(), signal_type, severity, evidence, reason),
         )
         self._conn.commit()
         return cursor.lastrowid
@@ -323,7 +431,7 @@ class Storage:
     def get_inbox_items(self, dismissed: bool = False, limit: int = 50) -> List[Dict]:
         rows = self._conn.execute(
             "SELECT id, timestamp, signal_type, severity, evidence, reason, dismissed "
-            "FROM inbox WHERE dismissed = ? ORDER BY timestamp DESC LIMIT ?",
+            "FROM inbox WHERE dismissed = ? ORDER BY id DESC LIMIT ?",
             (1 if dismissed else 0, limit),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -342,6 +450,99 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
+    # === Delivery Log ===
+
+    def record_delivery(
+        self,
+        kind: str,
+        channel: str,
+        status: str,
+        reason: str = "",
+        title: str = "",
+    ) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO delivery_log "
+            "(timestamp, kind, channel, status, reason, title) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now_local_iso(), kind, channel, status, reason, title),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def get_recent_delivery_logs(self, limit: int = 10) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT id, timestamp, kind, channel, status, reason, title "
+            "FROM delivery_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_delivery_issue(self) -> Optional[Dict]:
+        row = self._conn.execute(
+            "SELECT id, timestamp, kind, channel, status, reason, title "
+            "FROM delivery_log WHERE status IN ('failed', 'suppressed') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    # === Daily insights ===
+
+    def save_daily_insights(self, day: str, insights: List[object]) -> None:
+        self._conn.executemany(
+            "INSERT INTO daily_insights "
+            "(date, kind, title, body, evidence_json, suggestion, severity, "
+            "confidence, source_version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(date, kind, title) DO UPDATE SET "
+            "body=excluded.body, evidence_json=excluded.evidence_json, "
+            "suggestion=excluded.suggestion, severity=excluded.severity, "
+            "confidence=excluded.confidence, source_version=excluded.source_version, "
+            "created_at=datetime('now')",
+            [
+                (
+                    day,
+                    self._insight_value(insight, "kind"),
+                    self._insight_value(insight, "title"),
+                    self._insight_value(insight, "body"),
+                    json.dumps(
+                        self._insight_value(insight, "evidence", []),
+                        ensure_ascii=False,
+                    ),
+                    self._insight_value(insight, "suggestion", ""),
+                    self._insight_value(insight, "severity", 0.0),
+                    self._insight_value(insight, "confidence", 0.0),
+                    self._insight_value(insight, "source_version", 1),
+                )
+                for insight in insights
+            ],
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _insight_value(insight: object, key: str, default=None):
+        if isinstance(insight, dict):
+            return insight.get(key, default)
+        return getattr(insight, key, default)
+
+    def get_daily_insights(self, day: str) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT date, kind, title, body, evidence_json, suggestion, severity, "
+            "confidence, source_version, created_at "
+            "FROM daily_insights WHERE date = ? "
+            "ORDER BY severity DESC, confidence DESC, id ASC",
+            (day,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = self._safe_json_list(item.get("evidence_json"))
+            result.append(item)
+        return result
+
+    def delete_daily_insights(self, day: str) -> None:
+        self._conn.execute("DELETE FROM daily_insights WHERE date = ?", (day,))
+        self._conn.commit()
+
     # === Task sessions ===
 
     def save_task_session(
@@ -358,29 +559,65 @@ class Storage:
         outcome: str,
         confidence: float,
     ) -> int:
-        import json
+        session = TaskSession(
+            task_id=task_id,
+            label=label,
+            project=project,
+            intent=intent,
+            started_at=datetime.fromisoformat(started_at),
+            ended_at=datetime.fromisoformat(ended_at) if ended_at else None,
+            accumulated_sec=accumulated_sec,
+            modes=modes,
+            blockers=blockers,
+            outcome=outcome,
+            confidence=confidence,
+        )
+        self.upsert_task_session(session)
+        row = self._conn.execute(
+            "SELECT id FROM task_sessions WHERE session_uid = ?",
+            (session.session_uid,),
+        ).fetchone()
+        return int(row["id"]) if row else 0
 
-        cursor = self._conn.execute(
-            "INSERT INTO task_sessions "
-            "(task_id, label, project, intent, started_at, ended_at, accumulated_sec, "
-            "modes_json, blockers_json, outcome, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                label,
-                project,
-                intent,
-                started_at,
-                ended_at,
-                accumulated_sec,
-                json.dumps(modes, ensure_ascii=False),
-                json.dumps(blockers, ensure_ascii=False),
-                outcome,
-                confidence,
+    def upsert_task_session(self, session: TaskSession) -> None:
+        self._upsert_task_session_no_commit(session)
+        self._conn.commit()
+
+    @staticmethod
+    def _task_session_params(session: TaskSession) -> Tuple:
+        return (
+            session.session_uid,
+            session.task_id,
+            session.label,
+            session.project,
+            session.intent,
+            session.started_at.isoformat(),
+            session.ended_at.isoformat() if session.ended_at else None,
+            session.accumulated_sec,
+            json.dumps(session.modes, ensure_ascii=False),
+            json.dumps(session.blockers, ensure_ascii=False),
+            session.outcome,
+            session.confidence,
+            json.dumps(
+                [item.__dict__ for item in session.evidence],
+                ensure_ascii=False,
             ),
+            json.dumps(session.source, ensure_ascii=False),
+            session.version,
+        )
+
+    def finish_task_session(
+        self,
+        session_uid: str,
+        ended_at: str,
+        outcome: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE task_sessions SET ended_at = ?, outcome = ?, updated_at = datetime('now') "
+            "WHERE session_uid = ?",
+            (ended_at, outcome, session_uid),
         )
         self._conn.commit()
-        return cursor.lastrowid
 
     def upsert_task_daily_summary(
         self, day: str, task_id: str, label: str, total_sec: float
@@ -404,11 +641,115 @@ class Storage:
         return [dict(row) for row in rows]
 
     def get_task_sessions_for_day(self, day: str) -> List[Dict]:
+        return self.get_task_timeline(day)
+
+    def get_active_task_session(self) -> Optional[Dict]:
+        row = self._conn.execute(
+            "SELECT * FROM task_sessions "
+            "WHERE outcome = 'in_progress' OR ended_at IS NULL "
+            "ORDER BY datetime(started_at) DESC, id DESC LIMIT 1"
+        ).fetchone()
+        return self._task_row_to_dict(row) if row else None
+
+    def get_task_timeline(self, day: str) -> List[Dict]:
         rows = self._conn.execute(
             "SELECT * FROM task_sessions WHERE date(started_at) = ? ORDER BY started_at",
             (day,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._task_row_to_dict(row) for row in rows]
+
+    def get_task_session_summary(self, day: str) -> List[Dict]:
+        rows = self._conn.execute(
+            "SELECT task_id, label, SUM(accumulated_sec) AS total_sec "
+            "FROM task_sessions WHERE date(started_at) = ? "
+            "GROUP BY task_id, label ORDER BY total_sec DESC",
+            (day,),
+        ).fetchall()
+        return [dict(row) for row in rows if row["total_sec"]]
+
+    def rebuild_task_daily_summary(self, day: str) -> None:
+        rows = self.get_task_session_summary(day)
+        self._conn.execute("DELETE FROM task_daily_summary WHERE date = ?", (day,))
+        self._conn.executemany(
+            "INSERT INTO task_daily_summary (date, task_id, label, total_sec) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (day, row["task_id"], row["label"], row["total_sec"])
+                for row in rows
+            ],
+        )
+        self._conn.commit()
+
+    def replace_task_sessions_for_day(self, day: str, sessions: List[TaskSession]) -> None:
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                "DELETE FROM task_sessions WHERE date(started_at) = ?", (day,)
+            )
+            for session in sessions:
+                self._upsert_task_session_no_commit(session)
+            self._rebuild_task_daily_summary_no_commit(day)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _upsert_task_session_no_commit(self, session: TaskSession) -> None:
+        self._conn.execute(
+            "INSERT INTO task_sessions "
+            "(session_uid, task_id, label, project, intent, started_at, ended_at, "
+            "accumulated_sec, modes_json, blockers_json, outcome, confidence, "
+            "evidence_json, source_json, version, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(session_uid) DO UPDATE SET "
+            "task_id=excluded.task_id, label=excluded.label, project=excluded.project, "
+            "intent=excluded.intent, started_at=excluded.started_at, "
+            "ended_at=excluded.ended_at, accumulated_sec=excluded.accumulated_sec, "
+            "modes_json=excluded.modes_json, blockers_json=excluded.blockers_json, "
+            "outcome=excluded.outcome, confidence=excluded.confidence, "
+            "evidence_json=excluded.evidence_json, source_json=excluded.source_json, "
+            "version=excluded.version, updated_at=datetime('now')",
+            self._task_session_params(session),
+        )
+
+    def _rebuild_task_daily_summary_no_commit(self, day: str) -> None:
+        rows = self.get_task_session_summary(day)
+        self._conn.execute("DELETE FROM task_daily_summary WHERE date = ?", (day,))
+        self._conn.executemany(
+            "INSERT INTO task_daily_summary (date, task_id, label, total_sec) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (day, row["task_id"], row["label"], row["total_sec"])
+                for row in rows
+            ],
+        )
+
+    def task_session_from_row(self, row: Dict[str, Any]) -> TaskSession:
+        return TaskSession.from_dict(row)
+
+    def _task_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        data["modes"] = self._safe_json_list(data.get("modes_json"))
+        data["blockers"] = self._safe_json_list(data.get("blockers_json"))
+        data["evidence"] = self._safe_json_list(data.get("evidence_json"))
+        data["source"] = self._safe_json_dict(data.get("source_json"))
+        return data
+
+    @staticmethod
+    def _safe_json_list(raw: Any) -> List[Any]:
+        try:
+            value = json.loads(raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _safe_json_dict(raw: Any) -> Dict[str, Any]:
+        try:
+            value = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     # === State Snapshots (change-only) ===
 

@@ -9,6 +9,7 @@ Type=simple
 ExecStart=%h/.local/bin/aw-coach-daemon
 Restart=on-failure
 RestartSec=30
+Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 

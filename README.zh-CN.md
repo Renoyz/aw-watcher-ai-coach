@@ -43,12 +43,18 @@ python -m pip install -e ".[dev,ai,screenshot,web]"
 
 ```bash
 aw-coach doctor          # 环境诊断
+aw-coach health          # daemon / 推送 / 调度健康概览
 aw-coach status          # 今日概览
 aw-coach state           # 实时语义状态（需 daemon）
 aw-coach report          # 日报
 aw-coach report --full   # 含 AI 建议
+aw-coach insights today  # 日终额外观察
 aw-coach inbox list      # 查看主动辅助消息
 aw-coach task list       # 今日任务分布
+aw-coach task timeline today
+aw-coach task explain today
+aw-coach task rebuild yesterday
+aw-coach debug-day yesterday
 aw-coach serve           # 交互式 Web 仪表盘
 ```
 
@@ -64,6 +70,12 @@ PYTHONPATH=src python -m aw_coach.cli doctor
 
 ```bash
 aw-coach-daemon
+```
+
+开发目录运行时，建议让启动脚本或 service 使用项目 venv：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m aw_coach.daemon
 ```
 
 Windows 自启动：
@@ -105,10 +117,30 @@ quiet_hours_end = "08:00"
 instant_summary_interval_hours = 2
 background_ai_summary = false   # 灰度开启后台 LLM 叙事摘要
 morning_brief_time = "09:00"
+notification_budget_exempt_kinds = ["summary", "daily_report", "morning_brief"]
+hourly_backfill_hours = 168      # daemon 重启后最多回填最近 7 天完整小时
+llm_timeout_seconds = 90
+
+[report.delivery]
+instant_summary = "notify"   # notify | inbox | both | off
+daily_report = "notify"
+morning_brief = "inbox"
+medium_signal = "inbox"
+high_severity_signal = "notify"
+task_confirm = "inbox"
+task_confirm_min_minutes = 10
+task_confirm_daily_limit = 3
 
 [tasks]
 enabled = true
 project_roots = ["~/projects", "~/下载/activitywatch"]
+
+[context_capture]
+enabled = true
+interval_seconds = 60
+command_args_mode = "summary"  # off | summary | full
+capture_cwd = true
+capture_git = true
 
 [screenshot]
 enabled = false    # 默认关闭，保护隐私
@@ -121,9 +153,12 @@ enabled = false    # 默认关闭，保护隐私
 | 命令 | 说明 |
 | --- | --- |
 | `aw-coach inbox list/dismiss/accept` | 主动辅助收件箱 |
-| `aw-coach task list/confirm/set/review` | 任务感知与校准 |
+| `aw-coach insights DATE [--rebuild --json]` | 日终后台额外观察 |
+| `aw-coach task list/timeline/explain/rebuild/confirm/set/review` | 任务时间轴、回放与校准 |
+| `aw-coach debug-day DATE` | 原始切片、规则和任务会话的回放诊断 |
 | `aw-coach serve` | 交互式 Web 仪表盘 |
 | `aw-coach cost` | LLM 成本统计 |
+| `aw-coach health` | daemon、推送与调度健康概览 |
 | `aw-coach config show/set/path` | 配置管理 |
 | `aw-coach service status/logs` | Windows 服务诊断 |
 
@@ -133,6 +168,7 @@ enabled = false    # 默认关闭，保护隐私
 
 - ActivityWatch 事件数据保留在本地 ActivityWatch 数据库中。
 - AI 调用由配置中的后端决定。
+- 上下文采集只保存本地 cwd、Git repo/branch 和命令摘要，不读取文件内容。
 - 截图分析是可选功能，默认关闭。
 - 内置规则可以把敏感上下文标记为 `skip_screenshot`。
 - 不要提交本地数据库、报告、截图、日志或密钥。

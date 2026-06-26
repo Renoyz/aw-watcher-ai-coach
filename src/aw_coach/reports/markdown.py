@@ -7,6 +7,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from aw_coach.analyzer import AnalysisResult
+from aw_coach.daily_insights import render_daily_insights
 from aw_coach.reports.suggestions import generate_rule_suggestions
 
 
@@ -52,18 +53,24 @@ class ReportGenerator:
         use_ai: bool = False,
         project_breakdown: Optional[Dict[str, float]] = None,
         inbox_items: Optional[List[dict]] = None,
+        daily_insights: Optional[List[dict]] = None,
     ) -> str:
         sections = [
             self._header(report_date),
             self._overview_table(analysis),
         ]
+        if project_breakdown is None and analysis.task_breakdown:
+            project_breakdown = analysis.task_breakdown
         if project_breakdown:
-            sections.append(self._project_breakdown_section(project_breakdown))
+            sections.append(self._project_breakdown_section(project_breakdown, analysis))
         sections.extend([
             self._breakdown_section(analysis),
             self._energy_curve(analysis),
             self._suggestions_section(analysis, use_ai=use_ai),
         ])
+        insights_section = render_daily_insights(daily_insights or [])
+        if insights_section:
+            sections.append(insights_section)
         inbox_section = self._inbox_section(inbox_items)
         if inbox_section:
             sections.append(inbox_section)
@@ -87,15 +94,30 @@ class ReportGenerator:
                 m = int((hours - h) * 60)
                 lines.append(f"  {atype:<14} {bar}  {h}h {m:02d}m")
 
+            if analysis.task_breakdown:
+                lines.append("")
+                lines.append("  任务分布")
+                lines.append("  " + "─" * 30)
+                max_task_hours = max(analysis.task_breakdown.values())
+                for task, hours in sorted(
+                    analysis.task_breakdown.items(), key=lambda x: -x[1]
+                )[:5]:
+                    bar = _bar(hours, max_task_hours, 12)
+                    h = int(hours)
+                    m = int((hours - h) * 60)
+                    lines.append(f"  {task[:14]:<14} {bar}  {h}h {m:02d}m")
+
             lines.append("")
             lines.append(
                 f"  有效工作: {analysis.effective_hours:.1f}h  |  "
                 f"专注度: {analysis.focus_score}/100"
             )
             lines.append(
-                f"  任务切换: {analysis.switch_count} 次   |  "
+                f"  语义切换: {analysis.task_switch_count} 次   |  "
                 f"深度工作: {analysis.deep_work_hours:.1f}h"
             )
+            if analysis.switch_count != analysis.task_switch_count:
+                lines.append(f"  活动切换: {analysis.switch_count} 次")
         else:
             lines.append("  暂无数据")
 
@@ -122,6 +144,17 @@ class ReportGenerator:
         )
         ai_ratio = self._ai_collaboration_ratio(analysis)
         ai_line = f"| AI 协作占比 | {ai_ratio} |\n" if ai_ratio else ""
+        primary_switches = (
+            analysis.task_switch_count
+            if analysis.task_switch_count
+            else analysis.switch_count
+        )
+        switch_line = f"| 任务切换 | {primary_switches} 次 |\n"
+        activity_switch_line = (
+            f"| 活动类型切换 | {analysis.switch_count} 次 |\n"
+            if analysis.switch_count != analysis.task_switch_count
+            else ""
+        )
         return f"""## 今日概览
 
 | 指标 | 数值 |
@@ -129,16 +162,22 @@ class ReportGenerator:
 | 有效工作时长 | {analysis.effective_hours:.1f}h |
 | 深度工作时长 | {analysis.deep_work_hours:.2f}h |
 | 专注得分 | {analysis.focus_score}/100 |
-{productivity_line}{ai_line}| 任务切换 | {analysis.switch_count} 次 |"""
+{productivity_line}{ai_line}{switch_line}{activity_switch_line}"""
 
-    def _project_breakdown_section(self, project_breakdown: Dict[str, float]) -> str:
+    def _project_breakdown_section(
+        self, project_breakdown: Dict[str, float], analysis: Optional[AnalysisResult] = None
+    ) -> str:
         if not project_breakdown:
             return ""
         lines = ["## 任务/项目分布", ""]
         max_hours = max(project_breakdown.values())
         for project, hours in sorted(project_breakdown.items(), key=lambda x: -x[1]):
             bar = _bar(hours, max_hours, 20)
-            lines.append(f"  {project:<20} {bar} {hours:.1f}h")
+            deep = 0.0
+            if analysis is not None:
+                deep = analysis.task_deep_work_breakdown.get(project, 0.0)
+            suffix = f" | 深度 {deep:.1f}h" if deep > 0 else ""
+            lines.append(f"  {project:<20} {bar} {hours:.1f}h{suffix}")
         return "\n".join(lines)
 
     def _breakdown_section(self, analysis: AnalysisResult) -> str:

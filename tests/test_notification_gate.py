@@ -90,3 +90,12 @@ class TestNotificationGate:
         assert gate.seconds_since("task_confirm:x", now + timedelta(seconds=30)) == 30
         # record_event must not consume notification budget
         assert gate.notifications_today == 0
+
+    def test_record_notify_can_skip_budget(self):
+        gate = NotificationGate(max_per_day=1)
+        now = datetime(2026, 6, 11, 10, 0)
+        gate.record_notify("summary", now=now, consume_budget=False)
+        assert gate.notifications_today == 0
+        allowed, reason = gate.allow_notify("daily_report", now=now)
+        assert allowed is True
+        assert reason == "ok"

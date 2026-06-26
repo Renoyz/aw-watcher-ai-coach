@@ -6,7 +6,10 @@ Zero-dependency (uses only `ps` subprocess call) and Linux-first.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Terminal emulator process names (lowercase)
@@ -138,6 +141,16 @@ _CMD_ACTION_MAP: Dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class ProcessContextSnapshot:
+    process_name: Optional[str] = None
+    process_cwd: Optional[str] = None
+    git_repo: Optional[str] = None
+    git_branch: Optional[str] = None
+    terminal_command_summary: Optional[str] = None
+    terminal_action: Optional[str] = None
+
+
 def _parse_ps_output(stdout: str) -> List[Tuple[int, int, str, str]]:
     """Parse ps output into (pid, ppid, comm, args) tuples."""
     processes: List[Tuple[int, int, str, str]] = []
@@ -155,13 +168,20 @@ def _parse_ps_output(stdout: str) -> List[Tuple[int, int, str, str]]:
     return processes
 
 
-def _find_terminal_foreground_cmd(
+def is_terminal_app(app: Optional[str]) -> bool:
+    if not app:
+        return False
+    app_lower = app.lower()
+    return any(pattern in app_lower for pattern in _TERMINAL_PATTERNS)
+
+
+def _find_terminal_foreground_process(
     processes: List[Tuple[int, int, str, str]]
-) -> Optional[Tuple[str, str]]:
+) -> Optional[Tuple[int, str, str]]:
     """Find the most likely foreground command inside a terminal.
 
-    Returns (comm, args) or None.
-    Recursively descends past shells to find the real foreground command.
+    Returns (pid, comm, args) or None.  Prefer the real command inside a shell;
+    if the terminal is idle, fall back to the deepest shell so cwd is still useful.
     """
     # Build children map: pid -> list of (child_pid, comm, args)
     children: dict[int, List[Tuple[int, str, str]]] = {}
@@ -181,7 +201,8 @@ def _find_terminal_foreground_cmd(
             for child_pid, child_comm, child_args in children.get(pid, []):
                 child_comm_lower = child_comm.lower()
                 if child_comm_lower in _SHELL_NAMES or child_comm_lower in _BG_SERVICES:
-                    # Shells / bg services: keep recursing, don't include them
+                    if child_comm_lower in _SHELL_NAMES:
+                        results.append((child_pid, child_comm, child_args, depth))
                     results.extend(collect({child_pid}, depth + 1))
                 else:
                     results.append((child_pid, child_comm, child_args, depth))
@@ -191,9 +212,26 @@ def _find_terminal_foreground_cmd(
     if not candidates:
         return None
 
-    # Prefer deeper descendants (closer to real command) and shorter names
-    candidates.sort(key=lambda x: (-x[3], len(x[1])))
-    _pid, comm, args, _depth = candidates[0]
+    real_commands = [
+        c for c in candidates
+        if c[1].lower() not in _SHELL_NAMES and c[1].lower() not in _BG_SERVICES
+    ]
+    pool = real_commands or candidates
+    # Prefer deeper descendants (closer to real command) and shorter names.
+    pool.sort(key=lambda x: (-x[3], len(x[1])))
+    pid, comm, args, _depth = pool[0]
+    return pid, comm, args
+
+
+def _find_terminal_foreground_cmd(
+    processes: List[Tuple[int, int, str, str]]
+) -> Optional[Tuple[str, str]]:
+    result = _find_terminal_foreground_process(processes)
+    if result is None:
+        return None
+    _pid, comm, args = result
+    if comm.lower() in _SHELL_NAMES or comm.lower() in _BG_SERVICES:
+        return None
     return comm, args
 
 
@@ -222,6 +260,118 @@ def get_terminal_foreground_command() -> Optional[Tuple[str, str]]:
         return _find_terminal_foreground_cmd(processes)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
+
+
+def _get_user_processes() -> Optional[List[Tuple[int, int, str, str]]]:
+    try:
+        result = subprocess.run(
+            ["ps", "-u", str(os.getuid()), "-o", "pid,ppid,comm,args", "--no-headers"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return None
+        return _parse_ps_output(result.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def _read_process_cwd(pid: int) -> Optional[str]:
+    if not Path("/proc").exists():
+        return None
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def summarize_command(
+    comm: Optional[str],
+    args: Optional[str],
+    mode: str = "summary",
+) -> Optional[str]:
+    if not comm:
+        return None
+    if mode == "off":
+        return None
+    if mode == "full":
+        return args or comm
+
+    try:
+        tokens = shlex.split(args or comm)
+    except ValueError:
+        tokens = (args or comm).split()
+    if not tokens:
+        return comm
+
+    first = Path(tokens[0]).name
+    if first != comm and comm:
+        first = comm
+
+    def first_non_flag(start: int = 1) -> Optional[str]:
+        for token in tokens[start:]:
+            if token.startswith("-"):
+                continue
+            if "/" in token or token.startswith(("~", ".")):
+                continue
+            return token
+        return None
+
+    if first in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m":
+        return f"{first} -m {tokens[2]}"
+    if first in {"npm", "yarn", "pnpm"} and len(tokens) >= 3 and tokens[1] == "run":
+        return f"{first} run {tokens[2]}"
+    sub = first_non_flag(1)
+    if sub and first in {
+        "git", "gh", "glab", "cargo", "go", "docker", "kubectl",
+        "make", "cmake", "pytest", "tox", "poetry",
+    }:
+        return f"{first} {sub}"
+    return first
+
+
+def capture_process_context(
+    *,
+    active_app: Optional[str] = None,
+    command_args_mode: str = "summary",
+    capture_cwd: bool = True,
+    capture_git: bool = True,
+) -> Optional[ProcessContextSnapshot]:
+    """Capture lightweight local context for the active terminal window."""
+    if active_app is not None and not is_terminal_app(active_app):
+        return None
+
+    processes = _get_user_processes()
+    if not processes:
+        return None
+
+    found = _find_terminal_foreground_process(processes)
+    if found is None:
+        return None
+    pid, comm, args = found
+
+    cwd = _read_process_cwd(pid) if capture_cwd else None
+    git_repo = git_branch = None
+    if cwd and capture_git:
+        try:
+            from aw_coach.git_context import get_git_context_from_path
+
+            git_ctx = get_git_context_from_path(cwd)
+            if git_ctx:
+                git_repo = git_ctx.repo_name
+                git_branch = git_ctx.branch
+        except Exception:
+            pass
+
+    return ProcessContextSnapshot(
+        process_name=comm,
+        process_cwd=cwd,
+        git_repo=git_repo,
+        git_branch=git_branch,
+        terminal_command_summary=summarize_command(comm, args, command_args_mode),
+        terminal_action=infer_action_from_command(comm, args),
+    )
 
 
 def infer_action_from_command(

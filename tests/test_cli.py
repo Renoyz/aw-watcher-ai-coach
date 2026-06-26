@@ -9,10 +9,12 @@ from unittest.mock import patch
 import yaml
 from click.testing import CliRunner
 
-from aw_coach.cli import main
+from aw_coach.analyzer import AnalysisResult
+from aw_coach.cli import _dedupe_hourly_analysis_events, main
 from aw_coach.collector import ActivitySlice, DataCollector
-from aw_coach.config import Config, load_config
+from aw_coach.config import Config, CostConfig, ReportConfig, TasksConfig, load_config
 from aw_coach.storage import Storage
+from aw_coach.task_models import TaskSession
 
 
 def test_version_flag():
@@ -31,6 +33,57 @@ def test_no_subcommand_shows_help():
     assert "report" in result.output
     assert "doctor" in result.output
     assert "rule-test" in result.output
+
+
+def test_dedupe_hourly_analysis_events_prefers_full_hour():
+    ts = datetime(2026, 6, 23, 12, 0)
+    partial = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(minutes=31),
+        data={"type": "hourly_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+    full = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={"type": "hourly_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+    other = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={"type": "partial_hour_analysis", "period_start": "2026-06-23T12:00:00"},
+    )
+
+    result = _dedupe_hourly_analysis_events([partial, other, full])
+
+    assert result == [full]
+
+
+def test_dedupe_hourly_analysis_events_prefers_newer_schema():
+    ts = datetime(2026, 6, 23, 12, 0)
+    old_schema = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={
+            "type": "hourly_analysis",
+            "period_start": "2026-06-23T12:00:00",
+            "schema_version": 2,
+            "deep_work_hours": 0.1,
+        },
+    )
+    new_schema = SimpleNamespace(
+        timestamp=ts,
+        duration=timedelta(hours=1),
+        data={
+            "type": "hourly_analysis",
+            "period_start": "2026-06-23T12:00:00",
+            "schema_version": 3,
+            "deep_work_hours": 0.4,
+        },
+    )
+
+    result = _dedupe_hourly_analysis_events([old_schema, new_schema])
+
+    assert result == [new_schema]
 
 
 def test_rule_test_command():
@@ -75,6 +128,294 @@ def test_quiet_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["-q", "cost"])
     assert result.exit_code == 0
+
+
+def test_report_prefers_live_task_breakdown_over_stale_storage(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_daily_summary("2026-06-23", "old", "stale-task", 7200)
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+        task_breakdown={"fresh-task": 1.0},
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["report", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "fresh-task" in result.output
+    assert "stale-task" not in result.output
+
+
+def test_report_prefers_task_session_ledger(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_session(
+        TaskSession(
+            task_id="ledger:task",
+            label="ledger-task",
+            project=None,
+            intent="implement",
+            started_at=datetime(2026, 6, 23, 9, 0),
+            ended_at=datetime(2026, 6, 23, 10, 0),
+            accumulated_sec=3600,
+            outcome="progressed",
+        )
+    )
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+        task_breakdown={"live-task": 1.0},
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["report", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "ledger-task" in result.output
+    assert "live-task" not in result.output
+
+
+def test_task_timeline_and_explain_commands(tmp_path):
+    cfg = SimpleNamespace(db_path=tmp_path / "coach.db")
+    storage = Storage(cfg.db_path)
+    storage.upsert_task_session(
+        TaskSession(
+            task_id="aw-coach:main",
+            label="main.py",
+            project="aw-coach",
+            intent="implement",
+            started_at=datetime(2026, 6, 23, 9, 0),
+            ended_at=datetime(2026, 6, 23, 9, 30),
+            accumulated_sec=1800,
+            outcome="progressed",
+            confidence=0.8,
+            source={"app": "Code"},
+        )
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg):
+        runner = CliRunner()
+        timeline = runner.invoke(main, ["task", "timeline", "2026-06-23"])
+        explain = runner.invoke(main, ["task", "explain", "2026-06-23"])
+
+    assert timeline.exit_code == 0
+    assert "main.py" in timeline.output
+    assert "09:00-09:30" in timeline.output
+    assert explain.exit_code == 0
+    assert "uid=" in explain.output
+    assert "source: app=Code" in explain.output
+
+
+def test_insights_command_outputs_daily_observations(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    start = datetime(2026, 6, 23, 9, 0)
+    for idx in range(4):
+        storage.upsert_task_session(
+            TaskSession(
+                task_id="aw-coach:main",
+                label="main.py",
+                project="aw-coach",
+                intent="implement",
+                started_at=start + timedelta(minutes=idx * 20),
+                ended_at=start + timedelta(minutes=idx * 20 + 15),
+                accumulated_sec=900,
+                outcome="progressed",
+            )
+        )
+    analysis = AnalysisResult(
+        total_hours=1.0,
+        effective_hours=1.0,
+        deep_work_hours=0.0,
+        focus_score=50,
+        switch_count=1,
+        activity_breakdown={"programming": 1.0},
+        hourly_scores=[],
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=analysis):
+        runner = CliRunner()
+        result = runner.invoke(main, ["insights", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "## 额外观察" in result.output
+    assert "主任务被切成多段" in result.output
+
+
+def test_insights_command_json_output(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        reports_dir=tmp_path / "reports",
+        ai=SimpleNamespace(backend="rule_only"),
+    )
+    storage = Storage(cfg.db_path)
+    storage.save_daily_insights(
+        "2026-06-23",
+        [{
+            "kind": "productive_closure",
+            "title": "形成闭环",
+            "body": "body",
+            "evidence": [],
+            "suggestion": "",
+            "severity": 0.5,
+            "confidence": 0.7,
+            "source_version": 1,
+        }],
+    )
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli._get_analysis", return_value=None):
+        runner = CliRunner()
+        result = runner.invoke(main, ["insights", "--json", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert '"kind": "productive_closure"' in result.output
+
+
+def test_task_rebuild_dry_run_does_not_write(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["task", "rebuild", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "Dry-run only" in result.output
+    assert Storage(cfg.db_path).get_task_timeline("2026-06-23") == []
+
+
+def test_task_rebuild_apply_writes_sessions(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["task", "rebuild", "--apply", "2026-06-23"])
+
+    assert result.exit_code == 0
+    rows = Storage(cfg.db_path).get_task_timeline("2026-06-23")
+    assert len(rows) == 1
+    assert rows[0]["label"].startswith("main.py")
+
+
+def test_debug_day_outputs_replay_stages(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        tasks=TasksConfig(),
+    )
+    start = datetime(2026, 6, 23, 9, 0)
+    slices = [
+        ActivitySlice(
+            start=start,
+            end=start + timedelta(minutes=10),
+            duration=600,
+            is_afk=False,
+            primary_app="Code",
+            primary_title="main.py - aw-coach",
+        )
+    ]
+
+    class FakeCollector:
+        def fetch_range(self, _start, _end):
+            return slices
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.collector.DataCollector", return_value=FakeCollector()):
+        runner = CliRunner()
+        result = runner.invoke(main, ["debug-day", "2026-06-23"])
+
+    assert result.exit_code == 0
+    assert "raw_slices:" in result.output
+    assert "Final sessions" in result.output
+
+
+def test_health_command_reads_local_state(tmp_path):
+    cfg = SimpleNamespace(
+        db_path=tmp_path / "coach.db",
+        report=ReportConfig(),
+        cost=CostConfig(monthly_budget_usd=5.0),
+    )
+    storage = Storage(cfg.db_path)
+    storage.set_scheduler_state("last_hourly", "2026-06-17T09:00:00")
+    storage.set_scheduler_state("last_summary", "2026-06-17T09:30:00")
+    storage.record_delivery("summary", "notify", "sent", "ok", "AI Coach 摘要")
+
+    with patch("aw_coach.cli.load_config", return_value=cfg), \
+         patch("aw_coach.cli.shutil.which", return_value=None):
+        runner = CliRunner()
+        result = runner.invoke(main, ["health"])
+
+    assert result.exit_code == 0
+    assert "service:" in result.output
+    assert "last_summary:" in result.output
+    assert "last_delivery:" in result.output
+    assert "summary=notify" in result.output
 
 
 def test_config_path_command(monkeypatch, tmp_path):

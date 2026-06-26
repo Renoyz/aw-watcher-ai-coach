@@ -18,6 +18,7 @@ from aw_coach.collector import DataCollector
 from aw_coach.correction import VALID_ACTIVITY_TYPES
 from aw_coach.rules.engine import RuleEngine
 from aw_coach.storage import Storage
+from aw_coach.time_utils import format_local_timestamp
 from aw_coach.web.dashboard import dashboard_html
 from aw_coach.web.helpers import build_slice_timeline
 
@@ -87,6 +88,8 @@ class InteractiveReportServer:
                 if path == "/api/inbox":
                     storage = Storage(server.config.db_path)
                     items = storage.get_inbox_items(dismissed=False, limit=50)
+                    for item in items:
+                        item["local_timestamp"] = format_local_timestamp(item["timestamp"])
                     self._send_json({"items": items})
                     return
                 if path == "/api/tasks":
